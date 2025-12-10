@@ -574,4 +574,5 @@ Para problemas o sugerencias, revisa la consola del navegador para mensajes de d
 
 **Última actualización**: Noviembre 2024
 #   m a p 1  
+ #   m a p r o t a t e c l i e n t e  
  
