@@ -135,15 +135,9 @@ export class SocketService {
   }
 
   /**
-   * Escucha nuevas coordenadas GPS
+   * Escucha nuevas coordenadas GPS - DESHABILITADO (solo marcador local)
    */
-  onCoordenadaNueva(): Observable<{ id: number; lat: number; lng: number; accuracy?: number; timestamp: string; user_id?: string; numUsuario?: number; plataforma?: string }> {
-    return new Observable(observer => {
-      this.socket.on('coordenada:nueva', (data: { id: number; lat: number; lng: number; accuracy?: number; timestamp: string; user_id?: string; numUsuario?: number; plataforma?: string }) => {
-        observer.next(data);
-      });
-    });
-  }
+  // onCoordenadaNueva(): Observable<...> { ... }
 
   /**
    * Escucha cuando un cliente se conecta
@@ -175,17 +169,9 @@ export class SocketService {
   }
 
   /**
-   * Envía una actualización de coordenada GPS
+   * Envía una actualización de coordenada GPS - DESHABILITADO (solo marcador local)
    */
-  enviarCoordenada(lat: number, lng: number, accuracy?: number): void {
-    const userId = this.userId || this.userService.getUserIdSync();
-    this.socket.emit('coordenada:actualizar', { 
-      lat, 
-      lng, 
-      accuracy,
-      userId 
-    });
-  }
+  // enviarCoordenada(lat: number, lng: number, accuracy?: number): void { ... }
 
   /**
    * Obtiene el userId actual

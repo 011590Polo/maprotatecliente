@@ -91,16 +91,44 @@
         <ul tabindex="0" class="menu menu-sm dropdown-content bg-base-100 rounded-box z-[20001] mt-3 w-52 p-2 shadow">
           <li><a>Homepage</a></li>
           <li><a>Portfolio</a></li>
-          <li><a>About</a></li>
+          <!-- Mostrar Login o Logout según el estado de la sesión -->
+          <li *ngIf="!usuarioLogueado"><a (click)="abrirModalLogin()">Login</a></li>
+          <li *ngIf="usuarioLogueado">
+            <a class="text-primary">
+              <span class="font-semibold">{{ usuarioLogueado.usuario }}</span>
+              <span class="text-xs opacity-70">({{ usuarioLogueado.rol }})</span>
+            </a>
+          </li>
+          <li *ngIf="usuarioLogueado"><a (click)="cerrarSesion()" class="text-error">Logout</a></li>
         </ul>
       </div>
     </div>
 
     <div class="navbar-center">
       <a class="btn btn-ghost text-xl">OETAS</a>
+      <!-- Indicador de usuario logueado -->
+      <div *ngIf="usuarioLogueado" class="badge badge-primary badge-sm ml-2">
+        {{ usuarioLogueado.rol }}
+      </div>
     </div>
 
     <div class="navbar-end">
+      <!-- Indicador de precisión GPS -->
+      <div 
+        *ngIf="currentAccuracy !== undefined && currentAccuracy !== null"
+        class="badge badge-sm gap-1 mr-2"
+        [class.badge-success]="(currentAccuracy || 999) < 20"
+        [class.badge-warning]="(currentAccuracy || 999) >= 20 && (currentAccuracy || 999) <= 50"
+        [class.badge-error]="(currentAccuracy || 999) > 50"
+        title="Precisión GPS"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
+        </svg>
+        <span class="text-xs font-semibold">{{ (currentAccuracy || 999).toFixed(0) }}m</span>
+      </div>
+
       <button 
         type="button"
         class="btn btn-ghost btn-circle"
@@ -221,6 +249,7 @@
       (openMarkerModal)="abrirModalMarcador()"
       (loadSavedMarkers)="cargarMarcadoresGuardados()"
       (miUbicacionClick)="moverMarcadorAlCentro()"
+      (centrarMapaClick)="centrarMapa()"
     ></app-speed-dial>
   </div>
 
@@ -752,5 +781,76 @@
       </div>
     </div>
     <div class="modal-backdrop bg-black/80 backdrop-blur-sm" (click)="closeImageModal()"></div>
+  </div>
+
+  <!-- Modal de Login -->
+  <div class="modal z-[10000]" [class.modal-open]="modalLoginAbierto" *ngIf="modalLoginAbierto">
+    <div class="modal-box w-11/12 max-w-md shadow-2xl">
+      <!-- Header -->
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="font-bold text-xl text-base-content">🔐 Iniciar Sesión</h3>
+        <button
+          type="button"
+          class="btn btn-sm btn-circle btn-ghost"
+          (click)="cerrarModalLogin()"
+          aria-label="Cerrar modal"
+        >
+          ✕
+        </button>
+      </div>
+
+      <!-- Formulario de Login usando Fieldset de DaisyUI -->
+      <fieldset class="fieldset bg-base-200 border-base-300 rounded-box border p-4">
+        <legend class="fieldset-legend">Login</legend>
+
+        <!-- Mensaje de error -->
+        <div *ngIf="loginError" class="alert alert-error mb-4">
+          <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+          <span>{{ loginError }}</span>
+        </div>
+
+        <!-- Campo Usuario -->
+        <label class="label" for="login-usuario">
+          <span class="label-text">Usuario</span>
+        </label>
+        <input
+          type="text"
+          id="login-usuario"
+          class="input input-bordered w-full"
+          placeholder="Ingrese su usuario"
+          [(ngModel)]="loginUsuario"
+          [disabled]="loginCargando"
+        />
+
+        <!-- Campo Contraseña -->
+        <label class="label mt-4" for="login-clave">
+          <span class="label-text">Contraseña</span>
+        </label>
+        <input
+          type="password"
+          id="login-clave"
+          class="input input-bordered w-full"
+          placeholder="Ingrese su contraseña"
+          [(ngModel)]="loginClave"
+          [disabled]="loginCargando"
+          (keyup.enter)="iniciarSesion()"
+        />
+
+        <!-- Botón de Login -->
+        <button
+          type="button"
+          class="btn btn-neutral w-full mt-6"
+          (click)="iniciarSesion()"
+          [disabled]="loginCargando || !loginUsuario || !loginClave"
+        >
+          <span *ngIf="loginCargando" class="loading loading-spinner loading-sm mr-2"></span>
+          <span *ngIf="!loginCargando">Login</span>
+          <span *ngIf="loginCargando">Iniciando sesión...</span>
+        </button>
+      </fieldset>
+    </div>
+    <div class="modal-backdrop bg-black/50" (click)="cerrarModalLogin()"></div>
   </div>
 </div>

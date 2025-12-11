@@ -16,3 +16,5 @@ interface WakeLock {
 interface Navigator {
   wakeLock?: WakeLock;
 }
+
+

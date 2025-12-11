@@ -12,6 +12,7 @@ export class SpeedDialComponent {
   @Output() openMarkerModal = new EventEmitter<void>();
   @Output() loadSavedMarkers = new EventEmitter<void>();
   @Output() miUbicacionClick = new EventEmitter<void>();
+  @Output() centrarMapaClick = new EventEmitter<void>();
 
   // Claves de capas que existen en MapViewComponent.baseLayers
   private readonly capas: string[] = [
@@ -28,8 +29,8 @@ export class SpeedDialComponent {
   }
 
   centrarMapa(): void {
-    // TODO: integrar con Leaflet (centrar en posición base)
-    console.log('Acción: centrarMapa()');
+    // Emitir evento al componente padre para centrar el mapa en el marcador GPS real
+    this.centrarMapaClick.emit();
   }
 
   /**

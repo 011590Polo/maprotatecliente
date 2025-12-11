@@ -362,6 +362,8 @@ app.get('/api/coordenadas/rango', (req, res) => {
 const userSocketMap = new Map();
 // Mapa para rastrear si un usuario ya fue notificado como conectado en esta sesión
 const usuariosNotificados = new Map();
+// Mapa para mantener las últimas ubicaciones de cada usuario - DESHABILITADO (solo marcador local)
+// const ultimasUbicaciones = new Map();
 
 io.on('connection', (socket) => {
   console.log(`✅ Cliente conectado: ${socket.id}`);
@@ -451,6 +453,29 @@ io.on('connection', (socket) => {
         userId: id,
         usuario: getUsuarioById(id)
       });
+
+      // Envío de ubicaciones de usuarios conectados - DESHABILITADO (solo marcador local)
+      // const ubicacionesValidas = [];
+      // ultimasUbicaciones.forEach((ubicacion, userId) => {
+      //   // Validar coordenadas antes de incluir
+      //   if (ubicacion && 
+      //       Number.isFinite(ubicacion.lat) && 
+      //       Number.isFinite(ubicacion.lng) &&
+      //       !(ubicacion.lat === 0 && ubicacion.lng === 0) &&
+      //       ubicacion.lat >= -90 && ubicacion.lat <= 90 &&
+      //       ubicacion.lng >= -180 && ubicacion.lng <= 180) {
+      //     ubicacionesValidas.push({
+      //       userId,
+      //       lat: ubicacion.lat,
+      //       lng: ubicacion.lng,
+      //       speed: ubicacion.speed || 0,
+      //       timestamp: ubicacion.timestamp || Date.now()
+      //     });
+      //   }
+      // });
+      // if (ubicacionesValidas.length > 0) {
+      //   socket.emit('ubicaciones-usuarios-conectados', ubicacionesValidas);
+      // }
     } catch (error) {
       console.error('❌ Error al registrar usuario:', error);
       socket.emit('usuario-registrado', {
@@ -461,6 +486,8 @@ io.on('connection', (socket) => {
   });
 
   // ==================== ACTUALIZACIÓN DE UBICACIÓN ====================
+  // EVENTO DESHABILITADO - Solo marcador local, sin tracking multiusuario
+  /*
   socket.on('coordenada:actualizar', (data) => {
     try {
       const { lat, lng, accuracy, userId } = data;
@@ -509,12 +536,39 @@ io.on('connection', (socket) => {
   });
 
   // ==================== UBICACIÓN EN TIEMPO REAL ====================
+  // EVENTO DESHABILITADO - Solo marcador local, sin tracking multiusuario
+  /*
   socket.on('ubicacion-actual', (data) => {
     try {
-      const { userId, lat, lng, speed, timestamp } = data;
+      const { userId, lat, lng, speed, timestamp, accuracy } = data;
 
-      if (!lat || !lng) {
-        console.warn('⚠️  Ubicación inválida recibida');
+      // Validación estricta de coordenadas en el servidor
+      if (lat === undefined || lng === undefined || lat === null || lng === null) {
+        console.warn('⚠️  Ubicación inválida recibida: lat o lng faltantes');
+        return;
+      }
+
+      // Validar que sean números finitos
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        console.warn('⚠️  Ubicación inválida recibida: lat o lng no son números finitos', { lat, lng });
+        return;
+      }
+
+      // Rechazar coordenadas (0, 0) - punto nulo
+      if (lat === 0 && lng === 0) {
+        console.warn('⚠️  Ubicación inválida recibida: punto nulo (0, 0)');
+        return;
+      }
+
+      // Validar rangos
+      if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+        console.warn('⚠️  Ubicación inválida recibida: coordenadas fuera de rango', { lat, lng });
+        return;
+      }
+
+      // Validar accuracy si existe (descartar si > 200m)
+      if (accuracy !== undefined && accuracy !== null && Number.isFinite(accuracy) && accuracy > 200) {
+        console.warn('⚠️  Ubicación descartada: precisión GPS muy baja (>200m)', { lat, lng, accuracy });
         return;
       }
 
@@ -526,29 +580,41 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // Guardar coordenada en la base de datos (opcional, para historial)
-      try {
-        saveCoordenadaGPS({
-          user_id,
+      // Verificar si la posición cambió significativamente - DESHABILITADO (solo marcador local)
+      // const lastLocation = ultimasUbicaciones.get(user_id);
+      let shouldBroadcast = false; // Siempre false, no reenviar ubicaciones
+
+      // Actualizar última ubicación - DESHABILITADO (solo marcador local)
+      // ultimasUbicaciones.set(user_id, { ... });
+
+      // Solo guardar en BD y reenviar si hay cambio significativo
+      if (shouldBroadcast) {
+        // Guardar coordenada en la base de datos (opcional, para historial)
+        try {
+          saveCoordenadaGPS({
+            user_id,
+            lat,
+            lng,
+            accuracy: (accuracy !== undefined && accuracy !== null && Number.isFinite(accuracy)) ? accuracy : null,
+            timestamp: new Date().toISOString()
+          });
+        } catch (error) {
+          console.warn('Error al guardar coordenada en BD:', error);
+        }
+
+        // Reenviar ubicación a todos EXCEPTO al cliente emisor
+        socket.broadcast.emit('ubicacion-usuario', {
+          userId: user_id,
           lat,
           lng,
-          accuracy: null,
-          timestamp: new Date().toISOString()
+          speed: speed || 0,
+          accuracy: (accuracy !== undefined && accuracy !== null && Number.isFinite(accuracy)) ? accuracy : undefined,
+          timestamp: timestamp || Date.now()
         });
-      } catch (error) {
-        console.warn('Error al guardar coordenada en BD:', error);
+
+        // Solo loggear cuando realmente se reenvía (no cada 300ms)
+        console.log(`📍 Ubicación recibida de usuario ${user_id} y reenviada a otros clientes`);
       }
-
-      // Reenviar ubicación a todos EXCEPTO al cliente emisor
-      socket.broadcast.emit('ubicacion-usuario', {
-        userId: user_id,
-        lat,
-        lng,
-        speed: speed || 0,
-        timestamp: timestamp || Date.now()
-      });
-
-      console.log(`📍 Ubicación recibida de usuario ${user_id} y reenviada a otros clientes`);
     } catch (error) {
       console.error('❌ Error al procesar ubicación:', error);
     }
@@ -558,6 +624,9 @@ io.on('connection', (socket) => {
     const userId = socket.userId || null;
     
     if (userId) {
+      // Limpiar ubicación del usuario desconectado - DESHABILITADO (solo marcador local)
+      // ultimasUbicaciones.delete(userId);
+      
       // Verificar si el usuario tiene otro socket activo (reconexión rápida)
       const socketActual = userSocketMap.get(userId);
       

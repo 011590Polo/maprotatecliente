@@ -3,6 +3,7 @@ import { BehaviorSubject, Observable } from 'rxjs';
 import { getDistance, getGreatCircleBearing, getCompassDirection, getRhumbLineBearing } from 'geolib';
 import { SocketService } from './socket.service';
 import { UserService } from './user.service';
+import { CapacitorGpsService, CapacitorGeoPosition } from './capacitor-gps.service';
 
 export interface GeoPosition {
   lat: number;
@@ -18,17 +19,24 @@ export interface GeoPosition {
 })
 export class GeoService {
   private watchId: number | null = null;
+  private capacitorWatchId: string | null = null;
   private currentPositionSubject = new BehaviorSubject<GeoPosition | null>(null);
   public currentPosition$: Observable<GeoPosition | null> = this.currentPositionSubject.asObservable();
   private lastSentPosition: { lat: number; lng: number } | null = null;
-  private readonly MIN_DISTANCE_TO_SEND = 5; // Enviar si se movió al menos 5 metros
   private lastErrorTime: number = 0;
   private lastErrorCode: number | null = null;
   private readonly ERROR_THROTTLE_MS = 30000; // Solo mostrar el mismo error cada 30 segundos
+  private usingCapacitor: boolean = false;
+  private currentAccuracy: number = 999; // Para mostrar en UI
+  private lastSpeed: number = 0; // Última velocidad registrada para optimización
+  private updateInterval: number = 1000; // Intervalo base de actualización (1 segundo)
+  // locationSendIntervalId - ELIMINADO (solo marcador local)
+  private lastKnownPosition: GeoPosition | null = null; // Última posición conocida (solo para uso local)
 
   constructor(
     private socketService: SocketService,
-    private userService: UserService
+    private userService: UserService,
+    private capacitorGpsService: CapacitorGpsService
   ) {
     // Detectar cuando la app vuelve del background (reanudar)
     this.setupVisibilityChangeListener();
@@ -39,9 +47,84 @@ export class GeoService {
   }
 
   /**
-   * Inicia el seguimiento de ubicación en tiempo real
+   * Inicia el seguimiento de ubicación en tiempo real (híbrido: Capacitor primero, luego fallback)
+   * @param callback - Callback opcional para procesar coordenadas
    */
-  startTracking(): void {
+  async iniciarGPS(callback?: (position: GeoPosition) => void): Promise<void> {
+    // Intentar Capacitor primero
+    if (this.capacitorGpsService.isAvailable()) {
+      console.log('📱 Usando Capacitor Geolocation para mejor precisión');
+      this.usingCapacitor = true;
+      
+      this.capacitorWatchId = await this.capacitorGpsService.watchPositionCapacitor(
+        (position: CapacitorGeoPosition) => {
+          // Validar coordenadas antes de procesar
+          if (!position || !Number.isFinite(position.lat) || !Number.isFinite(position.lng)) {
+            console.warn('⚠️ Posición GPS de Capacitor inválida, descartando', position);
+            return;
+          }
+
+          const lat = position.lat;
+          const lng = position.lng;
+
+          // Rechazar coordenadas (0, 0)
+          if (lat === 0 && lng === 0) {
+            console.warn('⚠️ Posición GPS de Capacitor es (0, 0), descartando');
+            return;
+          }
+
+          // Validar rangos
+          if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+            console.warn('⚠️ Posición GPS de Capacitor fuera de rango, descartando', { lat, lng });
+            return;
+          }
+
+          // Sanitizar speed y heading para convertir undefined a null
+          const speedValue = (position.speed !== undefined && position.speed !== null && Number.isFinite(position.speed)) ? position.speed : null;
+          const headingValue = (position.heading !== undefined && position.heading !== null && Number.isFinite(position.heading)) ? position.heading : null;
+
+          const geoPosition: GeoPosition = {
+            lat,
+            lng,
+            accuracy: Number.isFinite(position.accuracy) ? position.accuracy : 999,
+            speed: speedValue,
+            heading: headingValue,
+            timestamp: position.timestamp
+          };
+
+          this.currentAccuracy = geoPosition.accuracy;
+          this.currentPositionSubject.next(geoPosition);
+          this.lastKnownPosition = geoPosition; // Guardar para envío periódico
+          
+          if (callback) {
+            callback(geoPosition);
+          }
+        }
+      );
+      
+      // Iniciar intervalo de envío periódico (300ms)
+      // startPeriodicLocationSend() - ELIMINADO (solo marcador local)
+
+      if (this.capacitorWatchId) {
+        return; // Capacitor funcionó, no usar fallback
+      } else {
+        // Capacitor falló, usar fallback
+        console.log('⚠️ Capacitor falló, usando API navegador como fallback');
+        this.usingCapacitor = false;
+      }
+    } else {
+      console.log('🌐 Capacitor no disponible, usando API navegador');
+      this.usingCapacitor = false;
+    }
+
+    // Fallback a API navegador
+    this.startTrackingFallback(callback);
+  }
+
+  /**
+   * Inicia el seguimiento de ubicación usando API navegador (fallback)
+   */
+  private startTrackingFallback(callback?: (position: GeoPosition) => void): void {
     if (this.watchId !== null) {
       console.warn('El seguimiento de ubicación ya está activo');
       return;
@@ -52,31 +135,68 @@ export class GeoService {
       return;
     }
 
+    // Configuración optimizada para máxima precisión GPS
     const options: PositionOptions = {
-      enableHighAccuracy: true,
-      maximumAge: 500,
-      timeout: 20000 // Aumentado a 20 segundos para dar más tiempo al GPS
+      enableHighAccuracy: true, // Forzar uso de GPS (no WiFi/red móvil)
+      maximumAge: 0, // No usar posiciones en caché, siempre obtener posición fresca (mejor precisión)
+      timeout: 30000 // Aumentado a 30 segundos para dar más tiempo al GPS
     };
+    
+    console.log('🔍 Iniciando seguimiento GPS con alta precisión (API navegador)...');
 
     this.watchId = navigator.geolocation.watchPosition(
       (position: GeolocationPosition) => {
+        // Validar que position.coords exista y tenga datos válidos
+        if (!position || !position.coords) {
+          console.warn('⚠️ Posición GPS sin coordenadas, descartando');
+          return;
+        }
+
+        // Validar que lat y lng sean números finitos
+        if (!Number.isFinite(position.coords.latitude) || !Number.isFinite(position.coords.longitude)) {
+          console.warn('⚠️ Coordenadas GPS inválidas (NaN o Infinity), descartando');
+          return;
+        }
+
+        const lat = position.coords.latitude;
+        const lng = position.coords.longitude;
+
+        // Rechazar coordenadas (0, 0) - punto nulo
+        if (lat === 0 && lng === 0) {
+          console.warn('⚠️ Coordenadas GPS inválidas (0, 0), descartando');
+          return;
+        }
+
+        // Validar rangos
+        if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+          console.warn('⚠️ Coordenadas GPS fuera de rango, descartando', { lat, lng });
+          return;
+        }
+
         // Reset error tracking cuando obtenemos una posición exitosa
         this.lastErrorTime = 0;
         this.lastErrorCode = null;
         
         const geoPosition: GeoPosition = {
-          lat: position.coords.latitude,
-          lng: position.coords.longitude,
-          accuracy: position.coords.accuracy,
-          speed: position.coords.speed,
-          heading: position.coords.heading,
+          lat,
+          lng,
+          accuracy: Number.isFinite(position.coords.accuracy) ? position.coords.accuracy : 999,
+          speed: Number.isFinite(position.coords.speed) ? position.coords.speed : null,
+          heading: Number.isFinite(position.coords.heading) ? position.coords.heading : null,
           timestamp: position.timestamp
         };
 
+        // Optimización de batería: ajustar intervalo según velocidad
+        const speed = geoPosition.speed || 0;
+        this.optimizeUpdateInterval(speed);
+
+        this.currentAccuracy = geoPosition.accuracy;
         this.currentPositionSubject.next(geoPosition);
+        this.lastKnownPosition = geoPosition; // Guardar para envío periódico
         
-        // Enviar ubicación vía socket cuando se mueve
-        this.enviarUbicacionSiNecesario(geoPosition);
+        if (callback) {
+          callback(geoPosition);
+        }
       },
       (error: GeolocationPositionError) => {
         // Throttle de errores: solo mostrar el mismo error cada 30 segundos
@@ -106,47 +226,176 @@ export class GeoService {
       },
       options
     );
+    
+    // Envío periódico de ubicación - ELIMINADO (solo marcador local)
+  }
+  
+  /**
+   * Inicia el intervalo para enviar ubicación - ELIMINADO (solo marcador local)
+   */
+  
+  /**
+   * Envía la ubicación real directamente - ELIMINADO (solo marcador local)
+   */
+
+  /**
+   * Inicia el seguimiento de ubicación en tiempo real (método legacy, mantiene compatibilidad)
+   */
+  startTracking(): void {
+    this.iniciarGPS();
   }
 
   /**
    * Detiene el seguimiento de ubicación
    */
-  stopTracking(): void {
+  async stopTracking(): Promise<void> {
+    // Limpieza de intervalo de envío - ELIMINADO (solo marcador local)
+    
+    if (this.usingCapacitor && this.capacitorWatchId) {
+      await this.capacitorGpsService.clearWatch();
+      this.capacitorWatchId = null;
+    }
+    
     if (this.watchId !== null) {
       navigator.geolocation.clearWatch(this.watchId);
       this.watchId = null;
-      this.currentPositionSubject.next(null);
     }
+    
+    this.currentPositionSubject.next(null);
+    this.usingCapacitor = false;
+    this.lastKnownPosition = null;
   }
 
   /**
-   * Obtiene la posición actual una sola vez
+   * Obtiene la precisión GPS actual
    */
-  getCurrentPosition(): Promise<GeoPosition> {
+  getCurrentAccuracy(): number {
+    return this.currentAccuracy;
+  }
+
+  /**
+   * Verifica si está usando Capacitor
+   */
+  isUsingCapacitor(): boolean {
+    return this.usingCapacitor;
+  }
+
+  /**
+   * Optimiza el intervalo de actualización según la velocidad para ahorrar batería
+   * Si velocidad < 1 km/h (0.28 m/s) → reducir a 3 segundos
+   * Si velocidad >= 1 km/h → usar 1-1.5 segundos
+   */
+  private optimizeUpdateInterval(speed: number): void {
+    const speedKmh = speed * 3.6; // Convertir m/s a km/h
+    
+    if (speedKmh < 1) {
+      // Vehículo detenido o moviéndose muy lento: actualizar cada 3 segundos
+      this.updateInterval = 3000;
+    } else {
+      // Vehículo en movimiento: actualizar cada 1-1.5 segundos
+      // Más rápido = más frecuente (hasta 1 segundo)
+      // Más lento = menos frecuente (hasta 1.5 segundos)
+      if (speedKmh > 50) {
+        this.updateInterval = 1000; // Alta velocidad: 1 segundo
+      } else if (speedKmh > 20) {
+        this.updateInterval = 1200; // Velocidad media: 1.2 segundos
+      } else {
+        this.updateInterval = 1500; // Velocidad baja: 1.5 segundos
+      }
+    }
+    
+    this.lastSpeed = speed;
+  }
+
+  /**
+   * Obtiene el intervalo de actualización actual
+   */
+  getUpdateInterval(): number {
+    return this.updateInterval;
+  }
+
+  /**
+   * Obtiene la posición actual una sola vez (híbrido: Capacitor primero, luego fallback)
+   */
+  async getCurrentPosition(): Promise<GeoPosition> {
+    // Intentar Capacitor primero
+    if (this.capacitorGpsService.isAvailable()) {
+      const capacitorPos = await this.capacitorGpsService.getCurrentPositionCapacitor();
+      if (capacitorPos) {
+        this.currentAccuracy = capacitorPos.accuracy;
+        return {
+          lat: capacitorPos.lat,
+          lng: capacitorPos.lng,
+          accuracy: capacitorPos.accuracy,
+          speed: capacitorPos.speed !== undefined ? capacitorPos.speed : null,
+          heading: capacitorPos.heading !== undefined ? capacitorPos.heading : null,
+          timestamp: capacitorPos.timestamp
+        };
+      }
+    }
+
+    // Fallback a API navegador
+    return this.getCurrentPositionFallback();
+  }
+
+  /**
+   * Obtiene la posición actual usando API navegador (fallback)
+   */
+  private getCurrentPositionFallback(): Promise<GeoPosition> {
     return new Promise((resolve, reject) => {
       if (!navigator.geolocation) {
         reject(new Error('Geolocalización no está soportada'));
         return;
       }
 
+      // Configuración optimizada para máxima precisión GPS
       const options: PositionOptions = {
-        enableHighAccuracy: true,
-        maximumAge: 5000,
-        timeout: 20000 // Aumentado a 20 segundos para dar más tiempo al GPS
+        enableHighAccuracy: true, // Forzar uso de GPS (no WiFi/red móvil)
+        maximumAge: 0, // No usar posiciones en caché, siempre obtener posición fresca (mejor precisión)
+        timeout: 30000 // Aumentado a 30 segundos para dar más tiempo al GPS
       };
+      
+      console.log('🔍 Obteniendo posición GPS con alta precisión (API navegador)...');
 
       navigator.geolocation.getCurrentPosition(
         (position: GeolocationPosition) => {
+          // Validar que position.coords exista y tenga datos válidos
+          if (!position || !position.coords) {
+            reject(new Error('Posición GPS sin coordenadas'));
+            return;
+          }
+
+          // Validar que lat y lng sean números finitos
+          if (!Number.isFinite(position.coords.latitude) || !Number.isFinite(position.coords.longitude)) {
+            reject(new Error('Coordenadas GPS inválidas (NaN o Infinity)'));
+            return;
+          }
+
+          const lat = position.coords.latitude;
+          const lng = position.coords.longitude;
+
+          // Rechazar coordenadas (0, 0) - punto nulo
+          if (lat === 0 && lng === 0) {
+            reject(new Error('Coordenadas GPS inválidas (0, 0)'));
+            return;
+          }
+
+          // Validar rangos
+          if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+            reject(new Error('Coordenadas GPS fuera de rango válido'));
+            return;
+          }
+
           // Reset error tracking cuando obtenemos una posición exitosa
           this.lastErrorTime = 0;
           this.lastErrorCode = null;
           
           const geoPosition: GeoPosition = {
-            lat: position.coords.latitude,
-            lng: position.coords.longitude,
-            accuracy: position.coords.accuracy,
-            speed: position.coords.speed,
-            heading: position.coords.heading,
+            lat,
+            lng,
+            accuracy: Number.isFinite(position.coords.accuracy) ? position.coords.accuracy : 999,
+            speed: Number.isFinite(position.coords.speed) ? position.coords.speed : null,
+            heading: Number.isFinite(position.coords.heading) ? position.coords.heading : null,
             timestamp: position.timestamp
           };
           resolve(geoPosition);
@@ -231,87 +480,43 @@ export class GeoService {
 
   /**
    * Obtiene las coordenadas actuales (alias para compatibilidad)
+   * Valida coordenadas antes de retornar
    */
   async getCurrentCoords(): Promise<{ lat: number; lng: number; speed: number; accuracy: number }> {
     const position = await this.getCurrentPosition();
+    
+    // Validar coordenadas antes de retornar
+    if (!Number.isFinite(position.lat) || !Number.isFinite(position.lng)) {
+      throw new Error('Coordenadas GPS inválidas (NaN o Infinity)');
+    }
+
+    if (position.lat === 0 && position.lng === 0) {
+      throw new Error('Coordenadas GPS nulas (0, 0)');
+    }
+
+    if (position.lat < -90 || position.lat > 90 || position.lng < -180 || position.lng > 180) {
+      throw new Error('Coordenadas GPS fuera de rango válido');
+    }
+
+    // Asegurar que speed siempre sea un número
+    const speedValue = (position.speed !== null && position.speed !== undefined && Number.isFinite(position.speed)) ? position.speed : 0;
+
     return {
       lat: position.lat,
       lng: position.lng,
-      speed: position.speed || 0,
-      accuracy: position.accuracy
+      speed: speedValue,
+      accuracy: Number.isFinite(position.accuracy) ? position.accuracy : 999
     };
   }
 
   /**
    * Envía la ubicación actual vía socket
+   * Valida coordenadas antes de enviar
    */
-  async enviarMiUbicacionActual(): Promise<void> {
-    try {
-      const coords = await this.getCurrentCoords();
-      const userId = await this.userService.getUserId();
-      const socket = this.socketService.getSocket();
-
-      if (socket && socket.connected) {
-        socket.emit('ubicacion-actual', {
-          userId,
-          lat: coords.lat,
-          lng: coords.lng,
-          speed: coords.speed || 0,
-          accuracy: coords.accuracy || null,
-          timestamp: Date.now()
-        });
-        console.log('📍 Ubicación inicial enviada:', { userId, lat: coords.lat, lng: coords.lng, speed: coords.speed, accuracy: coords.accuracy });
-      }
-    } catch (error) {
-      console.error('Error al enviar ubicación inicial:', error);
-    }
-  }
-
   /**
-   * Envía ubicación vía socket si es necesario (cuando se mueve significativamente)
+   * Envía la ubicación actual al servidor - ELIMINADO (solo marcador local)
    */
-  private async enviarUbicacionSiNecesario(position: GeoPosition): Promise<void> {
-    try {
-      const socket = this.socketService.getSocket();
-      if (!socket || !socket.connected) {
-        return;
-      }
 
-      // Verificar si se movió lo suficiente para enviar
-      let shouldSend = false;
-      if (!this.lastSentPosition) {
-        // Primera vez, siempre enviar
-        shouldSend = true;
-      } else {
-        // Calcular distancia desde última posición enviada
-        const distance = this.calcularDistancia(
-          { lat: position.lat, lng: position.lng },
-          { lat: this.lastSentPosition.lat, lng: this.lastSentPosition.lng }
-        );
-        // Enviar si se movió más de MIN_DISTANCE_TO_SEND metros
-        shouldSend = distance >= this.MIN_DISTANCE_TO_SEND;
-      }
-
-      if (shouldSend) {
-        const userId = await this.userService.getUserId();
-        const speed = position.speed || 0;
-
-        socket.emit('ubicacion-actual', {
-          userId,
-          lat: position.lat,
-          lng: position.lng,
-          speed: speed,
-          accuracy: position.accuracy || null,
-          timestamp: Date.now()
-        });
-
-        // Actualizar última posición enviada
-        this.lastSentPosition = { lat: position.lat, lng: position.lng };
-      }
-    } catch (error) {
-      console.error('Error al enviar ubicación:', error);
-    }
-  }
 
   /**
    * Configura listener para cuando la app vuelve del background
@@ -320,9 +525,8 @@ export class GeoService {
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', async () => {
         if (!document.hidden) {
-          // La app volvió al foreground, enviar ubicación actual
-          console.log('📱 App reanudada desde background, enviando ubicación...');
-          await this.enviarMiUbicacionActual();
+          // La app volvió al foreground - ELIMINADO envío de ubicación (solo marcador local)
+          console.log('📱 App reanudada desde background');
         }
       });
     }
@@ -336,8 +540,7 @@ export class GeoService {
       const connection = (navigator as any).connection || (navigator as any).mozConnection || (navigator as any).webkitConnection;
       if (connection) {
         connection.addEventListener('change', async () => {
-          console.log('🌐 Cambio de red detectado, enviando ubicación...');
-          await this.enviarMiUbicacionActual();
+          console.log('🌐 Cambio de red detectado - ELIMINADO envío de ubicación (solo marcador local)');
         });
       }
     }
@@ -345,8 +548,7 @@ export class GeoService {
     // También escuchar eventos online/offline
     if (typeof window !== 'undefined') {
       window.addEventListener('online', async () => {
-        console.log('🌐 Conexión restaurada, enviando ubicación...');
-        await this.enviarMiUbicacionActual();
+        console.log('🌐 Conexión restaurada - ELIMINADO envío de ubicación (solo marcador local)');
       });
     }
   }
@@ -357,11 +559,7 @@ export class GeoService {
   private setupSocketConnectionListener(): void {
     const socket = this.socketService.getSocket();
     socket.on('connect', async () => {
-      console.log('🔌 Socket conectado, enviando ubicación inicial...');
-      // Pequeño delay para asegurar que el socket esté completamente listo
-      setTimeout(async () => {
-        await this.enviarMiUbicacionActual();
-      }, 500);
+      console.log('🔌 Socket conectado - ELIMINADO envío de ubicación (solo marcador local)');
     });
   }
 }

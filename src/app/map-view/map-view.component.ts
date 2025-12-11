@@ -1,5 +1,5 @@
 import { AfterViewInit, Component, OnDestroy, ChangeDetectorRef } from '@angular/core';
-import * as L from 'leaflet';
+import maplibregl, { Map as MapLibreMap, Marker, Popup, NavigationControl, GeolocateControl } from 'maplibre-gl';
 import { SpeedDialComponent } from '../speed-dial/speed-dial.component';
 import { NotificationsPanelComponent } from '../notifications-panel/notifications-panel.component';
 import { NgIf, NgFor } from '@angular/common';
@@ -11,6 +11,11 @@ import { NotificationService } from '../services/notification.service';
 import { UserService } from '../services/user.service';
 import { Subscription } from 'rxjs';
 import { environment } from '../../environments/environment';
+import {
+  getBearing,
+  rotateMarker,
+  calculateDistance
+} from '../utils/marker-utils';
 
 @Component({
   selector: 'app-map-view',
@@ -20,19 +25,20 @@ import { environment } from '../../environments/environment';
   styleUrl: './map-view.component.css'
 })
 export class MapViewComponent implements AfterViewInit, OnDestroy {
-  private map?: L.Map;
-  private baseLayers: Record<string, L.TileLayer> = {};
+  private map?: MapLibreMap;
+  private baseLayers: Record<string, string> = {
+    // CartoDB Voyager como default - soporta CORS (estilo similar a OSM)
+    osmStandard: 'https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png',
+    osmHot: 'https://a.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png',
+    // Reemplazado OpenTopoMap (no soporta CORS, error 404) con CartoDB Voyager sin etiquetas
+    // Esta capa ofrece un estilo más limpio sin etiquetas de calles
+    osmTopo: 'https://a.basemaps.cartocdn.com/rastertiles/voyager_nolabels/{z}/{x}/{y}.png',
+    cartoPositron: 'https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
+    cartoDark: 'https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+  };
   private currentBaseKey: string = 'osmStandard';
-  private readonly defaultIcon = L.icon({
-    iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
-    iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
-    shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
-    iconSize: [25, 41],
-    iconAnchor: [12, 41],
-    popupAnchor: [1, -34],
-    tooltipAnchor: [16, -28],
-    shadowSize: [41, 41],
-  });
+  private routeSourceId: string = 'route-source';
+  private routeLayerId: string = 'route-layer';
 
   // Búsqueda de direcciones
   searchQuery: string = '';
@@ -40,15 +46,14 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
   searchInProgress: boolean = false;
   searchError: string | null = null;
   searchResults: { displayName: string; lat: number; lon: number }[] = [];
-  private searchMarker?: L.Marker;
+  private searchMarker?: Marker;
   private searchTimeout: any;
   searchBarVisible: boolean = false; // Controla la visibilidad de la barra de búsqueda
 
   // Geolocalización
-  private userLocationMarker?: L.Marker;
+  private userLocationMarker?: Marker;
   private geoSubscription?: Subscription;
-  private readonly userLocationIcon: L.DivIcon;
-  private smoothMoveAnimation?: any;
+  private smoothMoveAnimation?: number;
   private hasInitializedDraggable: boolean = false;
   private mapCenteredOnce: boolean = false;
 
@@ -89,6 +94,17 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
   mensajeGPS: string = 'Por favor, para conocer todos los lugares del mundo es necesario que actives el GPS.';
   verificandoGPS: boolean = false;
   gpsValidado: boolean = false; // Flag para evitar validaciones repetidas
+  currentAccuracy: number | undefined = undefined; // Precisión GPS actual para mostrar en UI
+
+  // Modal de Login
+  modalLoginAbierto: boolean = false;
+  loginUsuario: string = '';
+  loginClave: string = '';
+  loginError: string = '';
+  loginCargando: boolean = false;
+
+  // Usuario logueado
+  usuarioLogueado: { id: number; usuario: string; rol: string; estado: string } | null = null;
 
   // Sistema de notificaciones
   notificationsPanelVisible: boolean = false;
@@ -96,13 +112,10 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
   // No necesitamos lastLocationNotification ya que no notificamos nuestra propia ubicación
 
   // Marcadores guardados
-  private savedMarkers: L.Marker[] = [];
-  private readonly categoryIcons: Record<string, L.DivIcon | L.Icon> = {};
+  private savedMarkers: Marker[] = [];
+  private readonly categoryIcons: Record<string, HTMLElement> = {};
 
-  // Marcadores de usuarios en tiempo real
-  private markers: { [userId: string]: L.Marker } = {};
-  private iconPersona: L.Icon;
-  private iconCarro: L.Icon;
+  // Marcadores de usuarios en tiempo real - ELIMINADO (solo marcador local)
 
   // Suscripciones de socket para tiempo real
   private socketSubscriptions: Subscription[] = [];
@@ -111,8 +124,11 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
   // Wake Lock para evitar que la pantalla se apague en móviles
   private wakeLock: WakeLockSentinel | null = null;
 
-  // Listener para eventos personalizados desde popups de Leaflet
+  // Listener para eventos personalizados desde popups
   private imagePopupListener?: (event: any) => void;
+  
+  // Botón para resetear rotación
+  resetRotationButton?: HTMLButtonElement;
 
   constructor(
     private geoService: GeoService,
@@ -122,54 +138,33 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     private userService: UserService,
     private cdr: ChangeDetectorRef
   ) {
-    // Crear icono premium para ubicación del usuario
-    this.userLocationIcon = L.divIcon({
-      className: 'user-location-marker',
-      html: '<div class="user-location"></div>',
-      iconSize: [32, 32],
-      iconAnchor: [16, 16],
-    });
-
-    // Crear iconos personalizados para cada categoría usando DivIcon con colores
+    // Crear elementos HTML para iconos de categorías
     this.categoryIcons = {
-      'alerta': L.divIcon({
-        className: 'custom-marker',
-        html: '<div style="background-color: #fbbf24; width: 30px; height: 30px; border-radius: 50% 50% 50% 0; transform: rotate(-45deg); border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"><div style="transform: rotate(45deg); color: white; font-size: 18px; text-align: center; line-height: 24px; font-weight: bold;">⚠</div></div>',
-        iconSize: [30, 30],
-        iconAnchor: [15, 30],
-        popupAnchor: [0, -30],
-      }),
-      'peligro': L.divIcon({
-        className: 'custom-marker',
-        html: '<div style="background-color: #ef4444; width: 30px; height: 30px; border-radius: 50% 50% 50% 0; transform: rotate(-45deg); border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"><div style="transform: rotate(45deg); color: white; font-size: 18px; text-align: center; line-height: 24px; font-weight: bold;">🔥</div></div>',
-        iconSize: [30, 30],
-        iconAnchor: [15, 30],
-        popupAnchor: [0, -30],
-      }),
-      'informacion': L.divIcon({
-        className: 'custom-marker',
-        html: '<div style="background-color: #3b82f6; width: 30px; height: 30px; border-radius: 50% 50% 50% 0; transform: rotate(-45deg); border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"><div style="transform: rotate(45deg); color: white; font-size: 18px; text-align: center; line-height: 24px; font-weight: bold;">ℹ</div></div>',
-        iconSize: [30, 30],
-        iconAnchor: [15, 30],
-        popupAnchor: [0, -30],
-      }),
+      'alerta': this.createCategoryIcon('#fbbf24', '⚠'),
+      'peligro': this.createCategoryIcon('#ef4444', '🔥'),
+      'informacion': this.createCategoryIcon('#3b82f6', 'ℹ'),
     };
 
-    // Crear íconos para usuarios en tiempo real
-    this.iconPersona = L.icon({
-      iconUrl: 'assets/icons/person-static.svg',
-      iconSize: [32, 32],
-      iconAnchor: [16, 16],
-      popupAnchor: [0, -16]
-    });
-
-    this.iconCarro = L.icon({
-      iconUrl: 'assets/icons/car-moving.svg',
-      iconSize: [38, 38],
-      iconAnchor: [19, 19],
-      popupAnchor: [0, -19]
-    });
+    // Iconos de usuarios - ELIMINADO (solo marcador local)
   }
+
+  /**
+   * Crea un elemento HTML para icono de categoría
+   */
+  private createCategoryIcon(color: string, emoji: string): HTMLElement {
+    const el = document.createElement('div');
+    el.className = 'custom-marker';
+    el.innerHTML = `
+      <div style="background-color: ${color}; width: 30px; height: 30px; border-radius: 50% 50% 50% 0; transform: rotate(-45deg); border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);">
+        <div style="transform: rotate(45deg); color: white; font-size: 18px; text-align: center; line-height: 24px; font-weight: bold;">${emoji}</div>
+      </div>
+    `;
+    return el;
+  }
+
+  /**
+   * Crea un elemento HTML para icono de usuario - ELIMINADO (solo marcador local)
+   */
 
   ngAfterViewInit(): void {
     this.initMap();
@@ -185,9 +180,9 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
       this.initGeolocation();
     });
     this.initNotifications();
-    this.initUbicacionesTiempoReal();
+    // initUbicacionesTiempoReal() - ELIMINADO (solo marcador local)
     
-    // Listener para abrir modal de imagen desde popups de Leaflet
+    // Listener para abrir modal de imagen desde popups
     this.imagePopupListener = (event: any) => {
       if (event.detail) {
         this.openImageModal(event.detail);
@@ -216,6 +211,14 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
       cancelAnimationFrame(this.smoothMoveAnimation);
     }
 
+    // Limpiar marcadores de usuarios - ELIMINADO (solo marcador local)
+
+    // Limpiar marcadores guardados
+    this.savedMarkers.forEach(marker => {
+      marker.remove();
+    });
+    this.savedMarkers = [];
+
     // Limpiar mapa
     if (this.map) {
       this.map.remove();
@@ -225,62 +228,287 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     this.socketSubscriptions.forEach(sub => sub.unsubscribe());
     this.socketSubscriptions = [];
 
-    // Limpiar marcadores de usuarios
-    Object.values(this.markers).forEach(marker => {
-      if (this.map) {
-        this.map.removeLayer(marker);
+    // Limpiar listeners de notificaciones de conductores
+    const socket = this.socketService.getSocket();
+    if (socket) {
+      if ((this as any).notificacionConductorHandler) {
+        socket.off('notificacion-conductor', (this as any).notificacionConductorHandler);
       }
-    });
-    this.markers = {};
+      if ((this as any).notificacionUsuarioLogueadoHandler) {
+        socket.off('notificacion-usuario-logueado', (this as any).notificacionUsuarioLogueadoHandler);
+      }
+    }
   }
 
   private initMap(): void {
     // Coordenadas por defecto (se actualizarán con la ubicación real)
-    const defaultCenter: L.LatLngExpression = [11.0049, -74.8060];
+    const defaultCenter: [number, number] = [-74.8060, 11.0049]; // [lng, lat] para MapLibre
 
-    this.map = L.map('map', {
+    // Crear mapa MapLibre con rotación multitouch y tilt
+    this.map = new MapLibreMap({
+      container: 'map',
+      style: {
+        version: 8,
+        sources: {
+          'raster-tiles': {
+            type: 'raster',
+            tiles: [this.getTileUrl(this.currentBaseKey)],
+            tileSize: 256,
+            attribution: '&copy; OpenStreetMap contributors',
+            // Configuración para evitar problemas de CORS
+            scheme: 'xyz'
+          }
+        },
+        layers: [
+          {
+            id: 'simple-tiles',
+            type: 'raster',
+            source: 'raster-tiles',
+            minzoom: 0,
+            maxzoom: 22
+          }
+        ]
+      },
       center: defaultCenter,
-      zoom: 13
+      zoom: 13,
+      pitch: 0,
+      bearing: 0,
+      dragRotate: true, // Rotación multitouch con dos dedos
+      touchPitch: true, // Tilt con gestos
+      touchZoomRotate: true
     });
 
-    // Definir capas base (todas sin token, basadas en OpenStreetMap y Carto)
-    this.baseLayers = {
-      // 1) OpenStreetMap Standard
-      osmStandard: L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '&copy; OpenStreetMap contributors'
-      }),
-      // 2) OpenStreetMap Humanitarian (HOT)
-      osmHot: L.tileLayer('https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png', {
-        attribution: '&copy; OpenStreetMap contributors, Humanitarian OSM Team'
-      }),
-      // 4) OpenTopoMap
-      osmTopo: L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
-        attribution: 'Map data: &copy; OpenStreetMap contributors, SRTM | Style: &copy; OpenTopoMap'
-      }),
-      // 5) CartoDB Positron (Light)
-      cartoPositron: L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png', {
-        attribution: '&copy; OpenStreetMap contributors, &copy; CartoDB'
-      }),
-      // 6) CartoDB Dark Matter
-      cartoDark: L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', {
-        attribution: '&copy; OpenStreetMap contributors, &copy; CartoDB'
-      }),
-    };
+    // Agregar controles de navegación
+    this.map.addControl(new NavigationControl(), 'top-right');
 
-    // Agregar capa base inicial
-    this.baseLayers[this.currentBaseKey].addTo(this.map);
+    // Crear botón para resetear rotación
+    this.createResetRotationButton();
+
+    // Inicializar fuente y capa para rutas
+    this.map.on('load', () => {
+      if (this.map) {
+        this.setupRouteLayer();
+      }
+    });
+  }
+
+  /**
+   * Obtiene la URL de tiles según la capa seleccionada
+   * MapLibre requiere URLs sin {s} para subdominios, usamos 'a', 'b', 'c' como alternativas
+   * Todas las URLs usan servidores que soportan CORS para evitar errores de política de origen cruzado
+   * 
+   * Nota: Si aún tienes problemas de CORS, puedes usar un proxy CORS como:
+   * 'https://cors-anywhere.herokuapp.com/https://tile.openstreetmap.org/{z}/{x}/{y}.png'
+   * O configurar tu propio proxy CORS en el servidor
+   */
+  private getTileUrl(layerKey: string): string {
+    const urls: Record<string, string> = {
+      // CartoDB Voyager (estilo similar a OSM) - soporta CORS
+      osmStandard: 'https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png',
+      osmHot: 'https://a.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png',
+      // Reemplazado OpenTopoMap (no soporta CORS, error 404) con CartoDB Voyager sin etiquetas
+      // Esta capa ofrece un estilo más limpio sin etiquetas de calles, similar a un mapa topográfico
+      // Alternativa: puedes usar 'https://tile.stamen.com/terrain/{z}/{x}/{y}.png' si configuras proxy CORS
+      osmTopo: 'https://a.basemaps.cartocdn.com/rastertiles/voyager_nolabels/{z}/{x}/{y}.png',
+      cartoPositron: 'https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
+      cartoDark: 'https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+    };
+    return urls[layerKey] || urls['osmStandard'];
+  }
+
+  /**
+   * Crea botón para resetear rotación del mapa
+   */
+  private createResetRotationButton(): void {
+    this.resetRotationButton = document.createElement('button');
+    this.resetRotationButton.className = 'maplibregl-ctrl-icon maplibregl-ctrl-reset-rotation';
+    this.resetRotationButton.type = 'button';
+    this.resetRotationButton.innerHTML = '↻';
+    this.resetRotationButton.title = 'Resetear rotación';
+    this.resetRotationButton.style.cssText = `
+      width: 30px;
+      height: 30px;
+      background-color: white;
+      border: 1px solid rgba(0,0,0,0.2);
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 0 0 2px rgba(0,0,0,0.1);
+    `;
+    this.resetRotationButton.addEventListener('click', () => {
+      if (this.map) {
+        this.map.easeTo({
+          bearing: 0,
+          pitch: 0,
+          duration: 600
+        });
+      }
+    });
+
+    // Agregar al mapa después de que se cargue
+    if (this.map) {
+      this.map.on('load', () => {
+        const controls = document.querySelector('.maplibregl-ctrl-top-right');
+        if (controls && this.resetRotationButton) {
+          controls.appendChild(this.resetRotationButton);
+        }
+      });
+    }
+  }
+
+
+  /**
+   * Configura la capa para rutas (GeoJSON)
+   */
+  private setupRouteLayer(): void {
+    if (!this.map) return;
+
+    // Agregar fuente GeoJSON para rutas
+    this.map.addSource(this.routeSourceId, {
+      type: 'geojson',
+      data: {
+        type: 'FeatureCollection',
+        features: []
+      }
+    });
+
+    // Agregar capa de línea para rutas
+    this.map.addLayer({
+      id: this.routeLayerId,
+      type: 'line',
+      source: this.routeSourceId,
+      layout: {
+        'line-join': 'round',
+        'line-cap': 'round'
+      },
+      paint: {
+        'line-color': '#3b82f6',
+        'line-width': 4,
+        'line-opacity': 0.7
+      }
+    });
   }
 
   cambiarCapa(baseKey: string): void {
     if (!this.map || !this.baseLayers[baseKey]) return;
-    // Remover capa actual
-    const actual = this.baseLayers[this.currentBaseKey];
-    if (actual) {
-      this.map.removeLayer(actual);
+    
+    // Actualizar fuente de tiles
+    const source = this.map.getSource('raster-tiles') as maplibregl.RasterTileSource;
+    if (source) {
+      source.setTiles([this.getTileUrl(baseKey)]);
     }
-    // Agregar nueva capa
+    
     this.currentBaseKey = baseKey;
-    this.baseLayers[this.currentBaseKey].addTo(this.map);
+  }
+
+  /**
+   * Métodos obligatorios requeridos por la especificación
+   */
+
+  /**
+   * Crea el mapa (alias para initMap)
+   */
+  crearMapa(): void {
+    this.initMap();
+  }
+
+  /**
+   * Agrega marcador GPS del usuario (alias para updateUserLocation)
+   */
+  agregarMarcadorGPS(): void {
+    // Este método se llama automáticamente desde initGeolocation
+    // Se mantiene por compatibilidad
+  }
+
+  /**
+   * Actualiza el marcador GPS con nuevos datos
+   */
+  actualizarMarcadorGPS(data: GeoPosition): void {
+    this.updateUserLocation(data);
+  }
+
+  /**
+   * Centra el mapa en el marcador draggable
+   */
+  centerOnDraggableMarker(): void {
+    if (!this.map || !this.searchMarker) return;
+    
+    const lngLat = this.searchMarker.getLngLat();
+    this.map.easeTo({
+      center: [lngLat.lng, lngLat.lat],
+      duration: 600
+    });
+  }
+
+  /**
+   * Configura el marcador draggable (alias para setupSearchMarker)
+   */
+  setupDraggableMarker(coords: [number, number]): void {
+    this.setupSearchMarker(coords);
+  }
+
+  /**
+   * Agrega un marcador guardado al mapa (alias para agregarMarcadorAlMapa)
+   */
+  agregarMarcadorGuardado(marcador: Marcador): void {
+    this.agregarMarcadorAlMapa(marcador);
+  }
+
+  /**
+   * Pinta una ruta en el mapa usando GeoJSON
+   */
+  pintarRuta(rutaCoords: Array<[number, number]>): void {
+    if (!this.map) return;
+
+    // Convertir coordenadas a formato GeoJSON LineString
+    const coordinates = rutaCoords.map(coord => [coord[0], coord[1]]); // [lng, lat]
+
+    const source = this.map.getSource(this.routeSourceId) as maplibregl.GeoJSONSource;
+    if (source) {
+      source.setData({
+        type: 'FeatureCollection',
+        features: [
+          {
+            type: 'Feature',
+            geometry: {
+              type: 'LineString',
+              coordinates: coordinates
+            },
+            properties: {}
+          }
+        ]
+      });
+    }
+  }
+
+  /**
+   * Actualiza la ruta existente con nuevas coordenadas
+   */
+  actualizarRuta(rutaCoords: Array<[number, number]>): void {
+    this.pintarRuta(rutaCoords);
+  }
+
+  /**
+   * Cambia el estilo del mapa (alias para cambiarCapa)
+   */
+  cambiarEstiloMapa(styleUrl: string): void {
+    // Buscar la clave de capa que corresponde al styleUrl
+    const baseKey = Object.keys(this.baseLayers).find(key => 
+      this.getTileUrl(key).includes(styleUrl) || styleUrl.includes(key)
+    );
+    
+    if (baseKey) {
+      this.cambiarCapa(baseKey);
+    } else {
+      // Si no se encuentra, intentar usar directamente
+      const source = this.map?.getSource('raster-tiles') as maplibregl.RasterTileSource;
+      if (source && this.map) {
+        source.setTiles([styleUrl]);
+      }
+    }
   }
 
   async buscarDireccion(): Promise<void> {
@@ -330,8 +558,14 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
 
   seleccionarResultado(result: { displayName: string; lat: number; lon: number }): void {
     if (!this.map) return;
-    const coords: L.LatLngExpression = [result.lat, result.lon];
-    this.map.setView(coords, 16);
+    const coords: [number, number] = [result.lon, result.lat]; // [lng, lat] para MapLibre
+    
+    // Mover cámara suavemente
+    this.map.easeTo({
+      center: coords,
+      zoom: 16,
+      duration: 600
+    });
 
     this.setupSearchMarker(coords);
 
@@ -390,24 +624,39 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     }
   }
 
-  private setupSearchMarker(coords: L.LatLngExpression): void {
+  private setupSearchMarker(coords: [number, number]): void {
     if (!this.map) return;
 
     if (!this.searchMarker) {
-      this.searchMarker = L.marker(coords, {
-        icon: this.defaultIcon,
-        draggable: true,
-      });
-      this.searchMarker.addTo(this.map);
+      // Crear elemento HTML para el marcador de búsqueda (rojo)
+      const el = document.createElement('div');
+      el.className = 'search-marker';
+      el.style.width = '25px';
+      el.style.height = '41px';
+      el.style.backgroundImage = 'url(https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png)';
+      el.style.backgroundSize = 'contain';
+      el.style.backgroundRepeat = 'no-repeat';
+      el.style.cursor = 'grab';
+      el.style.filter = 'hue-rotate(0deg) saturate(2)'; // Hacer rojo
+
+      this.searchMarker = new Marker({
+        element: el,
+        draggable: true
+      })
+        .setLngLat(coords)
+        .addTo(this.map);
+
       this.searchMarker.on('dragend', () => this.onMarkerDragEnd());
     } else {
-      this.searchMarker.setLatLng(coords);
+      this.searchMarker.setLngLat(coords);
     }
   }
 
   private async onMarkerDragEnd(): Promise<void> {
     if (!this.map || !this.searchMarker) return;
-    const { lat, lng } = this.searchMarker.getLatLng();
+    const lngLat = this.searchMarker.getLngLat();
+    const lat = lngLat.lat;
+    const lng = lngLat.lng;
 
     this.searchInProgress = true;
     this.searchError = null;
@@ -435,8 +684,8 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     } catch (error) {
       console.error('Error en reverse geocoding:', error);
       // En caso de error, mostrar coordenadas
-      const { lat, lng } = this.searchMarker!.getLatLng();
-      this.searchQuery = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+      const lngLat = this.searchMarker!.getLngLat();
+      this.searchQuery = `${lngLat.lat.toFixed(6)}, ${lngLat.lng.toFixed(6)}`;
       this.searchResultValid = true;
       this.searchError = null;
     } finally {
@@ -538,7 +787,7 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
   }
 
   /**
-   * Inicializa el seguimiento de geolocalización
+   * Inicializa el seguimiento de geolocalización (híbrido: Capacitor primero, luego fallback)
    * El marcador de geolocalización es INDEPENDIENTE del marcador de búsqueda
    */
   private initGeolocation(): void {
@@ -546,79 +795,129 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     this.geoSubscription = this.geoService.currentPosition$.subscribe(
       (position: GeoPosition | null) => {
         if (position && this.map) {
+          // Actualizar accuracy para mostrar en UI
+          this.currentAccuracy = position.accuracy;
+          
           // Solo actualizar el marcador GPS, NO centrar el mapa ni actualizar la barra de búsqueda
           this.updateUserLocation(position);
         }
       }
     );
 
-    // Intentar obtener ubicación actual primero
+    // Intentar obtener ubicación actual primero (híbrido: Capacitor primero, luego fallback)
     this.geoService.getCurrentPosition()
       .then((position: GeoPosition) => {
         if (this.map) {
+          // Actualizar accuracy para mostrar en UI
+          this.currentAccuracy = position.accuracy;
+          
           // Centrar el mapa solo UNA VEZ al inicio en la ubicación real
           if (!this.mapCenteredOnce) {
-            const initialCoords: L.LatLngExpression = [position.lat, position.lng];
-            this.map.setView(initialCoords, 13);
+            const initialCoords: [number, number] = [position.lng, position.lat]; // [lng, lat]
+            this.map.easeTo({
+              center: initialCoords,
+              zoom: 13,
+              duration: 600
+            });
             this.mapCenteredOnce = true;
           }
           // Inicializar marcadores
           this.updateUserLocation(position);
         }
-        // Iniciar seguimiento continuo
-        this.geoService.startTracking();
+        // Iniciar seguimiento continuo (híbrido: Capacitor primero, luego fallback)
+        this.geoService.iniciarGPS((coords) => {
+          this.procesarNuevaCoordenada(coords);
+        });
       })
       .catch((error) => {
         console.warn('No se pudo obtener la ubicación inicial:', error);
         // Iniciar seguimiento de todas formas (puede que el usuario permita después)
-        this.geoService.startTracking();
+        this.geoService.iniciarGPS((coords) => {
+          this.procesarNuevaCoordenada(coords);
+        });
       });
+  }
+
+  /**
+   * Procesa una nueva coordenada GPS
+   * Mantiene toda la lógica existente de sockets y movimiento premium
+   */
+  private procesarNuevaCoordenada(position: GeoPosition): void {
+    if (!this.map) return;
+
+    // Actualizar accuracy para mostrar en UI
+    this.currentAccuracy = position.accuracy;
+
+    // Actualizar marcador GPS
+    this.updateUserLocation(position);
+
+    // Envío de ubicación vía socket - ELIMINADO (solo marcador local)
   }
 
   /**
    * Actualiza la posición del marcador de ubicación del usuario
    * Solo inicializa el marcador draggable UNA VEZ con la primera ubicación
    * Después solo actualiza el marcador real sin mover el mapa
+   * Usa coordenadas exactas sin filtros, con validación estricta
    */
   private updateUserLocation(position: GeoPosition): void {
     if (!this.map) return;
 
-    const newLatLng: L.LatLngExpression = [position.lat, position.lng];
+    // Validar coordenadas estrictamente antes de procesar
+    const sanitized = this.sanitizeLocation({ 
+      lat: position.lat, 
+      lng: position.lng, 
+      accuracy: position.accuracy 
+    });
+    
+    if (!sanitized) {
+      // Coordenada inválida: no actualizar marcador, mantener última posición válida
+      console.warn('⚠️ Coordenada GPS inválida descartada para marcador del usuario, manteniendo última posición válida');
+      return;
+    }
+
+    // Usar coordenadas sanitizadas y validadas
+    const newLngLat: [number, number] = [sanitized.lng, sanitized.lat];
 
     if (!this.userLocationMarker) {
       // Crear marcador GPS si no existe
-      console.log('Creando marcador de ubicación GPS en:', newLatLng);
-      this.userLocationMarker = L.marker(newLatLng, {
-        icon: this.userLocationIcon,
-        zIndexOffset: 1000,
-        interactive: false, // No interactivo para evitar conflictos
-      }).addTo(this.map);
+      console.log('Creando marcador de ubicación GPS en:', newLngLat);
+      
+      // Crear elemento HTML para marcador GPS premium
+      const el = document.createElement('div');
+      el.className = 'user-location-marker';
+      el.innerHTML = '<div class="user-location"></div>';
+      
+      this.userLocationMarker = new Marker({
+        element: el
+      })
+        .setLngLat(newLngLat)
+        .addTo(this.map);
 
       console.log('Marcador GPS creado:', this.userLocationMarker);
 
       // Inicializar el marcador draggable SOLO UNA VEZ con la posición inicial
       // IMPORTANTE: Solo inicializar si NO existe y NO se ha inicializado antes
       if (!this.hasInitializedDraggable && !this.searchMarker) {
-        this.setupSearchMarker(newLatLng);
+        this.setupSearchMarker(newLngLat);
         // Actualizar la barra de búsqueda con la dirección de la ubicación GPS
         this.updateSearchQueryFromPosition(position);
         this.hasInitializedDraggable = true;
-        console.log('Marcador draggable inicializado UNA VEZ en:', newLatLng);
+        console.log('Marcador draggable inicializado UNA VEZ en:', newLngLat);
       } else if (this.hasInitializedDraggable) {
         // Si ya se inicializó, NO hacer nada con el marcador draggable
         // NO moverlo, NO actualizarlo, NO cambiar sus coordenadas
       }
     } else {
-      // Solo actualizar la posición del marcador real sin mover el mapa
-      // Usar setLatLng directamente para actualización fluida
-      this.userLocationMarker.setLatLng(newLatLng);
+      // Actualizar la posición del marcador directamente con coordenadas exactas
+      this.userLocationMarker.setLngLat(newLngLat);
       
       // NO mostrar notificación de ubicación propia
       // Solo otros usuarios recibirán notificación cuando este usuario actualice su ubicación
       
       // GARANTIZAR que NO se actualice el marcador draggable
       // GARANTIZAR que NO se mueva la vista del mapa
-      // GARANTIZAR que NO se aplique setView, flyTo, ni centrar automáticamente
+      // GARANTIZAR que NO se aplique easeTo, flyTo, ni centrar automáticamente
       
       // Asegurar que hasInitializedDraggable esté en true para prevenir reinicialización
       if (!this.hasInitializedDraggable && this.searchMarker) {
@@ -627,46 +926,6 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     }
   }
 
-  /**
-   * Mueve un marcador suavemente entre dos posiciones
-   */
-  private smoothMoveMarker(marker: L.Marker, targetLatLng: L.LatLngExpression): void {
-    if (!marker) return;
-
-    const startLatLng = marker.getLatLng();
-    const target = L.latLng(targetLatLng);
-    const duration = 300; // ms
-    const startTime = performance.now();
-
-    // Cancelar animación anterior si existe
-    if (this.smoothMoveAnimation) {
-      cancelAnimationFrame(this.smoothMoveAnimation);
-    }
-
-    const animate = (currentTime: number) => {
-      const elapsed = currentTime - startTime;
-      const progress = Math.min(elapsed / duration, 1);
-
-      // Interpolación lineal (ease-out)
-      const easeOut = 1 - Math.pow(1 - progress, 3);
-
-      // Calcular posición intermedia
-      const currentLat = startLatLng.lat + (target.lat - startLatLng.lat) * easeOut;
-      const currentLng = startLatLng.lng + (target.lng - startLatLng.lng) * easeOut;
-
-      marker.setLatLng([currentLat, currentLng]);
-
-      if (progress < 1) {
-        this.smoothMoveAnimation = requestAnimationFrame(animate);
-      } else {
-        // Animación completada
-        marker.setLatLng(target);
-        this.smoothMoveAnimation = undefined;
-      }
-    };
-
-    this.smoothMoveAnimation = requestAnimationFrame(animate);
-  }
 
   /**
    * Actualiza la barra de búsqueda con la dirección de la posición actual
@@ -698,10 +957,10 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
   abrirModalMarcador(): void {
     // Obtener coordenadas del marcador de búsqueda actual
     if (this.searchMarker) {
-      const latLng = this.searchMarker.getLatLng();
+      const lngLat = this.searchMarker.getLngLat();
       this.coordenadasMarcador = {
-        lat: latLng.lat,
-        lng: latLng.lng
+        lat: lngLat.lat,
+        lng: lngLat.lng
       };
     } else {
       // Si no hay marcador de búsqueda, usar coordenadas por defecto
@@ -718,6 +977,53 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
 
     // Abrir modal
     this.modalMarcadorAbierto = true;
+  }
+
+  /**
+   * Centra el mapa en el marcador GPS real del usuario
+   * Útil para recuperar la posición cuando se pierde de vista
+   */
+  centrarMapa(): void {
+    if (!this.map) {
+      console.warn('⚠️ No se puede centrar el mapa: el mapa no está inicializado');
+      return;
+    }
+
+    // Verificar si existe el marcador GPS del usuario
+    if (!this.userLocationMarker) {
+      console.warn('⚠️ No se puede centrar el mapa: el marcador GPS del usuario no existe');
+      // Intentar obtener la ubicación actual si no existe el marcador
+      this.geoService.getCurrentPosition()
+        .then((position: GeoPosition) => {
+          if (this.map) {
+            const coords: [number, number] = [position.lng, position.lat];
+            this.map.easeTo({
+              center: coords,
+              zoom: 15,
+              duration: 800
+            });
+            console.log('📍 Mapa centrado en ubicación GPS actual');
+          }
+        })
+        .catch((error) => {
+          console.warn('⚠️ No se pudo obtener la ubicación GPS:', error);
+        });
+      return;
+    }
+
+    // Obtener la posición del marcador GPS
+    const userLocation = this.userLocationMarker.getLngLat();
+    if (userLocation) {
+      const coords: [number, number] = [userLocation.lng, userLocation.lat];
+      this.map.easeTo({
+        center: coords,
+        zoom: 15,
+        duration: 800
+      });
+      console.log('📍 Mapa centrado en marcador GPS del usuario:', coords);
+    } else {
+      console.warn('⚠️ No se pudo obtener la posición del marcador GPS');
+    }
   }
 
   /**
@@ -743,21 +1049,17 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
       return;
     }
 
+    // Convertir a [lng, lat] para MapLibre
+    const centerLngLat: [number, number] = [center.lng, center.lat];
+
     // Si el marcador draggable no existe, crearlo en el centro del mapa
     if (!this.searchMarker) {
-      this.setupSearchMarker([center.lat, center.lng]);
+      this.setupSearchMarker(centerLngLat);
       console.log(`📍 Marcador draggable creado en el centro del mapa: [${center.lat.toFixed(6)}, ${center.lng.toFixed(6)}]`);
     } else {
       // Mover el marcador existente al centro del mapa
-      this.searchMarker.setLatLng([center.lat, center.lng]);
+      this.searchMarker.setLngLat(centerLngLat);
       console.log(`📍 Marcador draggable movido al centro del mapa: [${center.lat.toFixed(6)}, ${center.lng.toFixed(6)}]`);
-      
-      // Asegurarse de que el marcador siga siendo draggable
-      // (esto es redundante ya que se establece en setupSearchMarker, pero es una verificación de seguridad)
-      if (!this.searchMarker.dragging?.enabled()) {
-        this.searchMarker.dragging?.enable();
-        console.log('✅ Capacidad de arrastre del marcador verificada y habilitada');
-      }
     }
 
     // Actualizar la barra de búsqueda con la nueva ubicación mediante geocodificación inversa
@@ -923,7 +1225,7 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
           // antes de cualquier operación para evitar que se muevan después de guardar
           const currentMapCenter = this.map?.getCenter();
           const currentMapZoom = this.map?.getZoom();
-          const currentSearchMarkerPos = this.searchMarker?.getLatLng();
+          const currentSearchMarkerPos = this.searchMarker?.getLngLat();
           
           // Cerrar modal y limpiar formulario
           this.cerrarModalMarcador();
@@ -936,21 +1238,49 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
             setTimeout(() => {
               if (this.map && currentMapCenter && currentMapZoom !== undefined) {
                 const newCenter = this.map.getCenter();
-                const distance = this.map.distance(currentMapCenter, newCenter);
+                // Calcular distancia aproximada
+                const lat1 = currentMapCenter.lat;
+                const lng1 = currentMapCenter.lng;
+                const lat2 = newCenter.lat;
+                const lng2 = newCenter.lng;
+                const R = 6371000; // Radio de la Tierra en metros
+                const dLat = (lat2 - lat1) * Math.PI / 180;
+                const dLng = (lng2 - lng1) * Math.PI / 180;
+                const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                  Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                  Math.sin(dLng/2) * Math.sin(dLng/2);
+                const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+                const distance = R * c;
                 // Si el mapa se movió más de 1 metro, restaurar la posición original
                 if (distance > 1) {
-                  this.map.setView(currentMapCenter, currentMapZoom, { animate: false });
+                  this.map.easeTo({
+                    center: [currentMapCenter.lng, currentMapCenter.lat],
+                    zoom: currentMapZoom,
+                    duration: 0
+                  });
                   console.log('Mapa restaurado a posición original después de guardar marcador');
                 }
               }
               
               // ASEGURAR que el marcador draggable no cambió de posición
               if (this.searchMarker && currentSearchMarkerPos) {
-                const currentPos = this.searchMarker.getLatLng();
-                const distance = this.map?.distance(currentSearchMarkerPos, currentPos) || 0;
+                const currentPos = this.searchMarker.getLngLat();
+                // Calcular distancia aproximada
+                const lat1 = currentSearchMarkerPos.lat;
+                const lng1 = currentSearchMarkerPos.lng;
+                const lat2 = currentPos.lat;
+                const lng2 = currentPos.lng;
+                const R = 6371000; // Radio de la Tierra en metros
+                const dLat = (lat2 - lat1) * Math.PI / 180;
+                const dLng = (lng2 - lng1) * Math.PI / 180;
+                const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                  Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                  Math.sin(dLng/2) * Math.sin(dLng/2);
+                const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+                const distance = R * c;
                 // Si el marcador se movió más de 1 metro, restaurar la posición original
                 if (distance > 1) {
-                  this.searchMarker.setLatLng(currentSearchMarkerPos);
+                  this.searchMarker.setLngLat(currentSearchMarkerPos);
                   console.log('Marcador draggable restaurado a posición original después de guardar');
                 }
               }
@@ -1035,12 +1365,20 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
 
     // Crear y agregar marcadores al mapa
     console.log(this.marcadoresGuardados);
+    const bounds: maplibregl.LngLatBounds = new maplibregl.LngLatBounds();
+    
     this.marcadoresGuardados.forEach((marcadorData) => {
-      const icono = this.categoryIcons[marcadorData.categoria] || this.defaultIcon;
+      const icono = this.categoryIcons[marcadorData.categoria];
+      if (!icono) return;
+
+      // Clonar el elemento para cada marcador
+      const iconoClone = icono.cloneNode(true) as HTMLElement;
       
-      const marker = L.marker([marcadorData.lat, marcadorData.lng], {
-        icon: icono,
-      });
+      const marker = new Marker({
+        element: iconoClone
+      })
+        .setLngLat([marcadorData.lng, marcadorData.lat])
+        .addTo(this.map!);
 
       // Crear contenido del popup
       const categoriaNombre = this.getCategoryName(marcadorData.categoria);
@@ -1085,17 +1423,24 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
 
       popupContent += `</div>`;
 
-      marker.bindPopup(popupContent);
-      if (this.map) {
-        marker.addTo(this.map);
-      }
+      const popup = new Popup({ offset: 25 })
+        .setHTML(popupContent);
+      
+      marker.setPopup(popup);
+      
+      // Guardar datos del marcador para referencia
+      (marker as any).marcadorData = marcadorData;
+      
       this.savedMarkers.push(marker);
+      bounds.extend([marcadorData.lng, marcadorData.lat]);
     });
 
     // Ajustar vista del mapa para mostrar todos los marcadores
-    if (this.savedMarkers.length > 0) {
-      const group = new L.FeatureGroup(this.savedMarkers);
-      this.map.fitBounds(group.getBounds().pad(0.1));
+    if (this.savedMarkers.length > 0 && bounds.getNorth() !== bounds.getSouth()) {
+      this.map!.fitBounds(bounds, {
+        padding: 50,
+        duration: 600
+      });
     }
 
     // Desactivar loading
@@ -1115,17 +1460,22 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
 
     // Verificar si el marcador ya existe en el mapa
     const existeMarcador = this.savedMarkers.some((marker: any) => {
-      const markerData = marker.options?.marcadorData;
+      const markerData = marker.marcadorData;
       return markerData?.id === marcadorData.id;
     });
 
     if (existeMarcador) return;
 
-    const icono = this.categoryIcons[marcadorData.categoria] || this.defaultIcon;
+    const icono = this.categoryIcons[marcadorData.categoria];
+    if (!icono) return;
+
+    // Clonar el elemento para cada marcador
+    const iconoClone = icono.cloneNode(true) as HTMLElement;
     
-    const marker = L.marker([marcadorData.lat, marcadorData.lng], {
-      icon: icono,
-    });
+    const marker = new Marker({
+      element: iconoClone
+    })
+      .setLngLat([marcadorData.lng, marcadorData.lat]);
 
     // Crear contenido del popup
     const categoriaNombre = this.getCategoryName(marcadorData.categoria);
@@ -1181,14 +1531,15 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
 
     popupContent += `</div>`;
 
-    marker.bindPopup(popupContent);
+    const popup = new Popup({ offset: 25 })
+      .setHTML(popupContent);
+    
+    marker.setPopup(popup);
     
     // Guardar datos del marcador en el marker para referencia
-    (marker as any).options.marcadorData = marcadorData;
+    (marker as any).marcadorData = marcadorData;
     
-    if (this.map) {
-      marker.addTo(this.map);
-    }
+    marker.addTo(this.map);
     this.savedMarkers.push(marker);
 
     // Actualizar lista de marcadores guardados si no existe
@@ -1258,14 +1609,12 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
           if (this.savedMarkers.length > 0 && response.data) {
             // Buscar y remover el marcador antiguo
             const markerIndex = this.savedMarkers.findIndex((marker: any) => {
-              return marker.options?.marcadorData?.id === response.data?.id;
+              return marker.marcadorData?.id === response.data?.id;
             });
 
             if (markerIndex !== -1) {
               const oldMarker = this.savedMarkers[markerIndex];
-              if (this.map) {
-                this.map.removeLayer(oldMarker);
-              }
+              oldMarker.remove();
               this.savedMarkers.splice(markerIndex, 1);
             }
 
@@ -1325,9 +1674,7 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
    */
   private limpiarMarcadoresGuardadosInterno(): void {
     this.savedMarkers.forEach(marker => {
-      if (this.map) {
-        this.map.removeLayer(marker);
-      }
+      marker.remove();
     });
     this.savedMarkers = [];
   }
@@ -1414,14 +1761,12 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
         
         // Buscar y remover el marcador antiguo
         const markerIndex = this.savedMarkers.findIndex((marker: any) => {
-          return marker.options?.marcadorData?.id === marcador.id;
+          return marker.marcadorData?.id === marcador.id;
         });
 
         if (markerIndex !== -1) {
           const oldMarker = this.savedMarkers[markerIndex];
-          if (this.map) {
-            this.map.removeLayer(oldMarker);
-          }
+          oldMarker.remove();
           this.savedMarkers.splice(markerIndex, 1);
         }
 
@@ -1445,14 +1790,12 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
         
         // Buscar y remover el marcador
         const markerIndex = this.savedMarkers.findIndex((marker: any) => {
-          return marker.options?.marcadorData?.id === data.id;
+          return marker.marcadorData?.id === data.id;
         });
 
         if (markerIndex !== -1) {
           const marker = this.savedMarkers[markerIndex];
-          if (this.map) {
-            this.map.removeLayer(marker);
-          }
+          marker.remove();
           this.savedMarkers.splice(markerIndex, 1);
         }
 
@@ -1559,6 +1902,34 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
         }
       });
       this.socketSubscriptions.push(subMarcadorCreado);
+
+      // Escuchar notificaciones de conductores (activo/inactivo)
+      const socket = this.socketService.getSocket();
+      
+      const notificacionConductorHandler = (data: { tipo: string; usuario: string; mensaje: string }) => {
+        if (data.tipo === 'activo') {
+          this.notificationService.pushNotification(data.mensaje, 'success');
+          this.mostrarAlerta(data.mensaje, 'success');
+        } else if (data.tipo === 'inactivo') {
+          this.notificationService.pushNotification(data.mensaje, 'warning');
+          this.mostrarAlerta(data.mensaje, 'warning');
+        }
+      };
+      
+      const notificacionUsuarioLogueadoHandler = (data: { usuario: string; rol: string; mensaje: string }) => {
+        // Solo mostrar si el usuario actual es conductor
+        if (this.usuarioLogueado && this.usuarioLogueado.rol === 'conductor') {
+          this.notificationService.pushNotification(data.mensaje, 'info');
+          this.mostrarAlerta(data.mensaje, 'info');
+        }
+      };
+
+      socket.on('notificacion-conductor', notificacionConductorHandler);
+      socket.on('notificacion-usuario-logueado', notificacionUsuarioLogueadoHandler);
+
+      // Guardar referencias para limpiar en ngOnDestroy
+      (this as any).notificacionConductorHandler = notificacionConductorHandler;
+      (this as any).notificacionUsuarioLogueadoHandler = notificacionUsuarioLogueadoHandler;
     }, 0);
 
     // La notificación de marcador guardado se maneja en initSocketListeners
@@ -1573,79 +1944,172 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
   }
 
   /**
-   * Inicializa el sistema de ubicaciones en tiempo real
+   * Inicializa el sistema de ubicaciones en tiempo real - ELIMINADO
+   * Solo se mantiene el marcador local y draggable
    */
-  private initUbicacionesTiempoReal(): void {
-    const socket = this.socketService.getSocket();
-    
-    // Escuchar ubicaciones de otros usuarios (actualizaciones en tiempo real)
-    socket.on('ubicacion-usuario', (data: { userId: string; lat: number; lng: number; speed: number; timestamp: number }) => {
-      this.pintarOActualizarUbicacion(data);
-    });
 
-    // Escuchar todas las ubicaciones de usuarios ya conectados cuando este usuario se conecta
-    socket.on('ubicaciones-usuarios-conectados', (ubicaciones: Array<{ userId: string; lat: number; lng: number; speed: number; timestamp: number }>) => {
-      console.log(`📍 Recibidas ${ubicaciones.length} ubicación(es) de usuarios ya conectados`);
-      // Procesar cada ubicación
-      ubicaciones.forEach(ubicacion => {
-        this.pintarOActualizarUbicacion(ubicacion);
-      });
+  /**
+   * Sanitiza y valida coordenadas GPS estrictamente
+   * Retorna coordenada válida o null si debe descartarse
+   */
+  private sanitizeLocation(data: { lat: number; lng: number; accuracy?: number | null }): { lat: number; lng: number; accuracy?: number | null } | null {
+    // Validar que lat y lng existan y sean números finitos
+    if (!Number.isFinite(data.lat) || !Number.isFinite(data.lng)) {
+      console.warn('⚠️ Coordenada inválida: lat o lng no es un número finito', data);
+      return null;
+    }
+
+    const lat = data.lat;
+    const lng = data.lng;
+
+    // Rechazar coordenadas (0, 0) - punto nulo
+    if (lat === 0 && lng === 0) {
+      console.warn('⚠️ Coordenada inválida: punto nulo (0, 0)', data);
+      return null;
+    }
+
+    // Validar rangos de latitud y longitud
+    if (lat < -90 || lat > 90) {
+      console.warn('⚠️ Coordenada inválida: latitud fuera de rango', { lat, lng });
+      return null;
+    }
+
+    if (lng < -180 || lng > 180) {
+      console.warn('⚠️ Coordenada inválida: longitud fuera de rango', { lat, lng });
+      return null;
+    }
+
+    // Validar accuracy si existe: descartar si es > 200 metros
+    if (data.accuracy !== undefined && data.accuracy !== null) {
+      if (!Number.isFinite(data.accuracy) || data.accuracy > 200) {
+        console.warn('⚠️ Coordenada descartada: precisión GPS muy baja (>200m)', { lat, lng, accuracy: data.accuracy });
+        return null;
+      }
+    }
+
+    // Coordenada válida
+    return {
+      lat,
+      lng,
+      accuracy: data.accuracy
+    };
+  }
+
+  /**
+   * Pinta o actualiza la ubicación de un usuario en el mapa - ELIMINADO
+   * Solo se mantiene el marcador local y draggable
+   */
+
+  /**
+   * Abre el modal de login
+   */
+  abrirModalLogin(): void {
+    this.modalLoginAbierto = true;
+    this.loginError = '';
+    this.loginUsuario = '';
+    this.loginClave = '';
+  }
+
+  /**
+   * Cierra el modal de login
+   */
+  cerrarModalLogin(): void {
+    this.modalLoginAbierto = false;
+    this.loginError = '';
+    this.loginUsuario = '';
+    this.loginClave = '';
+    this.loginCargando = false;
+  }
+
+  /**
+   * Inicia sesión con las credenciales ingresadas
+   */
+  iniciarSesion(): void {
+    if (!this.loginUsuario || !this.loginClave) {
+      this.loginError = 'Por favor, complete todos los campos';
+      return;
+    }
+
+    this.loginCargando = true;
+    this.loginError = '';
+
+    const socket = this.socketService.getSocket();
+
+    if (!socket || !socket.connected) {
+      this.loginCargando = false;
+      this.loginError = 'No hay conexión con el servidor. Intente nuevamente.';
+      return;
+    }
+
+    // Escuchar respuesta del servidor (solo una vez)
+    const respuestaHandler = (respuesta: { success: boolean; usuario?: any; error?: string }) => {
+      this.loginCargando = false;
+
+      if (respuesta.success && respuesta.usuario) {
+        // Login exitoso
+        this.usuarioLogueado = respuesta.usuario;
+        this.mostrarAlerta(`Bienvenido, ${respuesta.usuario.usuario} (${respuesta.usuario.rol})`, 'success');
+        this.cerrarModalLogin();
+        
+        console.log('✅ Login exitoso:', respuesta.usuario);
+      } else {
+        // Error en el login
+        this.loginError = respuesta.error || 'Error al iniciar sesión';
+        console.error('❌ Error en login:', respuesta.error);
+      }
+
+      // Remover el listener después de usarlo
+      socket.off('login-respuesta', respuestaHandler);
+    };
+
+    // Escuchar respuesta del servidor
+    socket.on('login-respuesta', respuestaHandler);
+
+    // Enviar credenciales al servidor
+    socket.emit('login', {
+      usuario: this.loginUsuario.trim(),
+      clave: this.loginClave
     });
   }
 
   /**
-   * Pinta o actualiza la ubicación de un usuario en el mapa
+   * Cierra la sesión del usuario
    */
-  private pintarOActualizarUbicacion(data: { userId: string; lat: number; lng: number; speed: number; timestamp: number }): void {
-    if (!this.map) return;
+  cerrarSesion(): void {
+    const socket = this.socketService.getSocket();
+    const usuarioAnterior = this.usuarioLogueado?.usuario || 'Usuario';
 
-    const { userId, lat, lng, speed } = data;
-
-    // Verificar que no sea el usuario actual (no debería pasar, pero por seguridad)
-    const myUserId = this.userService.getUserIdSync();
-    if (userId === myUserId) {
-      return; // No mostrar nuestra propia ubicación como marcador adicional
+    if (!socket || !socket.connected) {
+      // Si no hay conexión, cerrar sesión localmente
+      this.usuarioLogueado = null;
+      this.mostrarAlerta(`Sesión cerrada. Hasta luego, ${usuarioAnterior}`, 'info');
+      return;
     }
 
-    // Regla de detección de movimiento: speed > 1 m/s
-    const isMoving = speed && speed > 1;
+    // Escuchar respuesta del servidor (solo una vez)
+    const respuestaHandler = (respuesta: { success: boolean; error?: string }) => {
+      if (respuesta.success) {
+        // Limpiar información del usuario
+        this.usuarioLogueado = null;
+        // Mostrar mensaje de confirmación
+        this.mostrarAlerta(`Sesión cerrada. Hasta luego, ${usuarioAnterior}`, 'info');
+        console.log('✅ Sesión cerrada');
+      } else {
+        // Error al cerrar sesión (aún así limpiar localmente)
+        this.usuarioLogueado = null;
+        this.mostrarAlerta('Sesión cerrada localmente', 'warning');
+        console.warn('⚠️ Error al cerrar sesión en el servidor:', respuesta.error);
+      }
 
-    // Seleccionar ícono según el estado de movimiento
-    const icon = isMoving ? this.iconCarro : this.iconPersona;
+      // Remover el listener después de usarlo
+      socket.off('logout-respuesta', respuestaHandler);
+    };
 
-    // Si no existe el marcador, crearlo
-    if (!this.markers[userId]) {
-      this.markers[userId] = L.marker([lat, lng], { icon }).addTo(this.map);
-      
-      // Agregar popup con información del usuario
-      const speedKmh = speed ? (speed * 3.6).toFixed(1) : '0.0';
-      const estado = isMoving ? 'En movimiento' : 'Detenido';
-      this.markers[userId].bindPopup(`
-        <div style="min-width: 150px;">
-          <strong>Usuario: ${userId.substring(0, 8)}...</strong><br>
-          <small>Estado: ${estado}</small><br>
-          <small>Velocidad: ${speedKmh} km/h</small>
-        </div>
-      `);
-      
-      console.log(`📍 Marcador creado para usuario ${userId} en [${lat}, ${lng}] - ${estado}`);
-    } else {
-      // Solo actualizar ubicación e ícono
-      this.markers[userId]
-        .setLatLng([lat, lng])
-        .setIcon(icon);
-      
-      // Actualizar popup con nueva información
-      const speedKmh = speed ? (speed * 3.6).toFixed(1) : '0.0';
-      const estado = isMoving ? 'En movimiento' : 'Detenido';
-      this.markers[userId].setPopupContent(`
-        <div style="min-width: 150px;">
-          <strong>Usuario: ${userId.substring(0, 8)}...</strong><br>
-          <small>Estado: ${estado}</small><br>
-          <small>Velocidad: ${speedKmh} km/h</small>
-        </div>
-      `);
-    }
+    // Escuchar respuesta del servidor
+    socket.on('logout-respuesta', respuestaHandler);
+
+    // Enviar evento de logout al servidor
+    socket.emit('logout');
   }
 
   /**
@@ -1684,12 +2148,13 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     
     // Si los permisos están denegados, mostrar mensaje específico
     if (estadoPermisos === 'denied') {
-      this.mostrarModalGPS('Por favor, para conocer todos los lugares del mundo es necesario que actives el GPS. Por favor, permite el acceso a la ubicación en la configuración de tu navegador.');
+      this.mostrarModalGPS('Por favor, para conocer todos los lugares del mundo es necesario que actives el GPS con ubicación precisa. Por favor, permite el acceso a la ubicación PRECISA en la configuración de tu navegador o dispositivo.');
       this.gpsPermisoDenegado = true;
       return;
     }
 
     this.verificandoGPS = true;
+    console.log('📍 Verificando permisos de ubicación precisa...');
 
     try {
       // Intentar obtener la posición actual (esto solicita permisos automáticamente si es necesario)
@@ -1702,8 +2167,7 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
         me.setupSearchMarker([position.lat, position.lng]);
         me.updateSearchQueryFromPosition(position);
         
-        // Transmitir la ubicación inicial en tiempo real a los demás clientes conectados
-        this.enviarUbicacionEnTiempoReal(position);      
+        // Envío de ubicación vía socket - ELIMINADO (solo marcador local)      
 
       }
 
@@ -1799,34 +2263,9 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
   }
 
   /**
-   * Envía la ubicación en tiempo real a los demás clientes conectados
+   * Envía la ubicación en tiempo real a los demás clientes conectados - ELIMINADO
+   * Solo se mantiene el marcador local y draggable
    */
-  private async enviarUbicacionEnTiempoReal(position: GeoPosition): Promise<void> {
-    try {
-      const userId = await this.userService.getUserId();
-      const socket = this.socketService.getSocket();
-
-      if (socket && socket.connected) {
-        socket.emit('ubicacion-actual', {
-          userId,
-          lat: position.lat,
-          lng: position.lng,
-          speed: position.speed || 0,
-          timestamp: Date.now()
-        });
-        console.log('📍 Ubicación transmitida en tiempo real:', { 
-          userId, 
-          lat: position.lat, 
-          lng: position.lng, 
-          speed: position.speed 
-        });
-      } else {
-        console.warn('⚠️ Socket no conectado, no se puede enviar ubicación');
-      }
-    } catch (error) {
-      console.error('Error al enviar ubicación en tiempo real:', error);
-    }
-  }
 
   /**
    * Activa el Wake Lock para evitar que la pantalla se apague en dispositivos móviles

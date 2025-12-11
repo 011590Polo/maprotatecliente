@@ -12,6 +12,30 @@
 #map {
   height: 100%;
   width: 100%;
+  position: relative;
+}
+
+/* Estilos para MapLibre GL */
+.maplibregl-popup {
+  z-index: 1000;
+}
+
+.maplibregl-popup-content {
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.maplibregl-ctrl {
+  z-index: 1000;
+}
+
+/* Marcador de búsqueda (rojo) */
+.search-marker {
+  cursor: grab;
+}
+
+.search-marker:active {
+  cursor: grabbing;
 }
 
 /* Marcador premium de ubicación del usuario */
