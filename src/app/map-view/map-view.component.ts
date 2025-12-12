@@ -2449,7 +2449,7 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     // Crear handler una sola vez y guardar referencia
     // OPTIMIZACIÓN: Usar NgZone.run para actualizaciones fuera de Angular
     this.conductorLocationHandler = (data: any) => {
-      console.log('📥 Ubicación de conductor recibida:', data);
+      //console.log('📥 Ubicación de conductor recibida:', data);
       // Ejecutar fuera de Angular para máxima velocidad
       this.ngZone.runOutsideAngular(() => {
         this.procesarUbicacionConductor(data);
@@ -2738,30 +2738,42 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
         // Actualizar última posición válida SOLO si la actualización fue exitosa
         this.conductoresLastPositions.set(conductorId, newPos);
         
-        // Actualizar popup con nueva información
-        // IMPORTANTE: closeOnClick: false y closeOnMove: false para que no se cierre automáticamente
-        const speedKmh = (speed && Number.isFinite(speed)) ? (speed * 3.6).toFixed(1) : '0.0';
-        const popup = new Popup({ 
-          offset: 25,
-          closeOnClick: false, // No cerrar al hacer clic en el mapa
-          closeOnMove: false, // No cerrar al mover el mapa
-          closeButton: true, // Mostrar botón de cerrar
-          maxWidth: '300px'
-        })
-          .setHTML(`
+        // CRÍTICO: NO recrear el popup - solo actualizar su contenido si ya existe
+        // Esto evita que se cierre el popup cuando el usuario lo tiene abierto
+        const popupExistente = marker.getPopup();
+        if (popupExistente) {
+          // Solo actualizar el contenido HTML del popup existente
+          const speedKmh = (speed && Number.isFinite(speed)) ? (speed * 3.6).toFixed(1) : '0.0';
+          popupExistente.setHTML(`
             <div style="min-width: 150px; pointer-events: auto;" onclick="event.stopPropagation();">
               <strong>🚗 Conductor: ${usuario}</strong><br>
               <small>Velocidad: ${speedKmh} km/h</small>
             </div>
           `);
-        
-        // Prevenir que el popup se cierre al hacer clic en el mapa
-        marker.setPopup(popup);
-        
-        // Agregar listener para prevenir el cierre del popup
-        marker.on('click', (e) => {
-          e.originalEvent?.stopPropagation();
-        });
+        } else {
+          // Solo crear popup si no existe (primera vez)
+          const speedKmh = (speed && Number.isFinite(speed)) ? (speed * 3.6).toFixed(1) : '0.0';
+          const popup = new Popup({ 
+            offset: 25,
+            closeOnClick: false, // No cerrar al hacer clic en el mapa
+            closeOnMove: false, // No cerrar al mover el mapa
+            closeButton: true, // Mostrar botón de cerrar
+            maxWidth: '300px'
+          })
+            .setHTML(`
+              <div style="min-width: 150px; pointer-events: auto;" onclick="event.stopPropagation();">
+                <strong>🚗 Conductor: ${usuario}</strong><br>
+                <small>Velocidad: ${speedKmh} km/h</small>
+              </div>
+            `);
+          
+          marker.setPopup(popup);
+          
+          // Agregar listener para prevenir el cierre del popup (solo una vez)
+          marker.on('click', (e) => {
+            e.originalEvent?.stopPropagation();
+          });
+        }
       } catch (error) {
         console.error(`❌ Error al actualizar marcador de conductor ${usuario}:`, error);
         // NO actualizar si hay error - mantener última posición válida
