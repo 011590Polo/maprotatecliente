@@ -355,7 +355,7 @@
         <button
           type="button"
           class="btn btn-sm btn-primary flex-1 gap-1"
-          [disabled]="!selectedCategory || !descripcionMarcador.trim() || descripcionMarcador.length < 10"
+          [disabled]="!selectedCategory || !descripcionMarcador.trim() || descripcionMarcador.trim().length < 10 || !coordenadasMarcador"
           (click)="guardarMarcador()"
         >
           <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -436,7 +436,7 @@
             Total de marcadores: {{ marcadoresGuardados.length }}
           </li>
           
-          <li *ngFor="let marcador of marcadoresGuardados" class="list-row">
+          <li *ngFor="let marcador of marcadoresGuardados; trackBy: trackByMarcadorId" class="list-row">
             <!-- Imagen/Video/Icono según categoría o archivo adjunto -->
             <div>
               <img

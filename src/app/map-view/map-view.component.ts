@@ -1,4 +1,4 @@
-import { AfterViewInit, Component, OnDestroy, ChangeDetectorRef } from '@angular/core';
+import { AfterViewInit, Component, OnDestroy, ChangeDetectorRef, ChangeDetectionStrategy, NgZone } from '@angular/core';
 import maplibregl, { Map as MapLibreMap, Marker, Popup, NavigationControl, GeolocateControl } from 'maplibre-gl';
 import { SpeedDialComponent } from '../speed-dial/speed-dial.component';
 import { NotificationsPanelComponent } from '../notifications-panel/notifications-panel.component';
@@ -12,17 +12,17 @@ import { UserService } from '../services/user.service';
 import { Subscription } from 'rxjs';
 import { environment } from '../../environments/environment';
 import {
-  getBearing,
-  rotateMarker,
   calculateDistance
 } from '../utils/marker-utils';
+// ELIMINADO: getBearing y rotateMarker - no se usan para marcadores de conductores (pueden causar saltos)
 
 @Component({
   selector: 'app-map-view',
   standalone: true,
   imports: [SpeedDialComponent, NotificationsPanelComponent, NgIf, NgFor, FormsModule],
   templateUrl: './map-view.component.html',
-  styleUrl: './map-view.component.css'
+  styleUrl: './map-view.component.css',
+  changeDetection: ChangeDetectionStrategy.OnPush // OPTIMIZACIÓN: OnPush para mejor rendimiento
 })
 export class MapViewComponent implements AfterViewInit, OnDestroy {
   private map?: MapLibreMap;
@@ -115,7 +115,14 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
   private savedMarkers: Marker[] = [];
   private readonly categoryIcons: Record<string, HTMLElement> = {};
 
-  // Marcadores de usuarios en tiempo real - ELIMINADO (solo marcador local)
+  // Marcadores de conductores en tiempo real
+  private conductoresMarkers: { [conductorId: string]: Marker } = {};
+  private conductoresLastPositions = new Map<string, { lat: number; lng: number }>(); // Última posición para rotación
+  // Mapa para asociar usuario con conductorId (para eliminar marcadores cuando se recibe notificación inactivo)
+  private conductoresUsuarios: Map<string, string> = new Map(); // usuario -> conductorId
+  private iconCarroElement: HTMLElement;
+  private conductorTrackingInitialized: boolean = false; // Flag para evitar listeners duplicados
+  private conductorLocationHandler?: (data: any) => void; // Referencia al handler para poder removerlo
 
   // Suscripciones de socket para tiempo real
   private socketSubscriptions: Subscription[] = [];
@@ -136,7 +143,8 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     private socketService: SocketService,
     private notificationService: NotificationService,
     private userService: UserService,
-    private cdr: ChangeDetectorRef
+    private cdr: ChangeDetectorRef,
+    private ngZone: NgZone // OPTIMIZACIÓN: NgZone para actualizaciones fuera de Angular
   ) {
     // Crear elementos HTML para iconos de categorías
     this.categoryIcons = {
@@ -145,7 +153,8 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
       'informacion': this.createCategoryIcon('#3b82f6', 'ℹ'),
     };
 
-    // Iconos de usuarios - ELIMINADO (solo marcador local)
+    // Crear elemento HTML para icono de conductor tipo Waze
+    this.iconCarroElement = this.createConductorIcon(40);
   }
 
   /**
@@ -163,11 +172,63 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
   }
 
   /**
-   * Crea un elemento HTML para icono de usuario - ELIMINADO (solo marcador local)
+   * Crea un elemento HTML para icono de conductor tipo Waze (círculo con punto central)
    */
+  private createConductorIcon(size: number): HTMLElement {
+    const el = document.createElement('div');
+    el.style.width = `${size}px`;
+    el.style.height = `${size}px`;
+    el.style.position = 'relative';
+    el.style.display = 'flex';
+    el.style.alignItems = 'center';
+    el.style.justifyContent = 'center';
+    
+    // Círculo exterior (borde azul)
+    const outerCircle = document.createElement('div');
+    outerCircle.style.width = `${size}px`;
+    outerCircle.style.height = `${size}px`;
+    outerCircle.style.borderRadius = '50%';
+    outerCircle.style.backgroundColor = '#3b82f6'; // Azul
+    outerCircle.style.border = '3px solid white';
+    outerCircle.style.boxShadow = '0 2px 8px rgba(0,0,0,0.3), 0 0 0 2px rgba(59, 130, 246, 0.3)';
+    outerCircle.style.position = 'absolute';
+    outerCircle.style.top = '0';
+    outerCircle.style.left = '0';
+    
+    // Círculo interior (punto central blanco)
+    const innerCircle = document.createElement('div');
+    const innerSize = size * 0.4; // 40% del tamaño total
+    innerCircle.style.width = `${innerSize}px`;
+    innerCircle.style.height = `${innerSize}px`;
+    innerCircle.style.borderRadius = '50%';
+    innerCircle.style.backgroundColor = 'white';
+    innerCircle.style.boxShadow = '0 1px 3px rgba(0,0,0,0.2)';
+    innerCircle.style.position = 'absolute';
+    innerCircle.style.top = '50%';
+    innerCircle.style.left = '50%';
+    innerCircle.style.transform = 'translate(-50%, -50%)';
+    innerCircle.style.zIndex = '1';
+    
+    // Agregar elementos al contenedor
+    el.appendChild(outerCircle);
+    el.appendChild(innerCircle);
+    
+    // SIN transiciones ni animaciones - actualización directa
+    el.style.transition = 'none'; // Sin transiciones
+    // SIN transiciones ni animaciones - actualización directa para evitar saltos
+    el.style.transition = 'none';
+    el.style.animation = 'none';
+    el.style.cursor = 'pointer';
+    
+    return el;
+  }
 
   ngAfterViewInit(): void {
     this.initMap();
+    
+    // Restaurar sesión del usuario desde localStorage
+    this.restaurarSesion();
+    
     // Activar Wake Lock para evitar que la pantalla se apague
     this.activarWakeLock();
     // Validar GPS antes de inicializar geolocalización
@@ -180,7 +241,11 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
       this.initGeolocation();
     });
     this.initNotifications();
-    // initUbicacionesTiempoReal() - ELIMINADO (solo marcador local)
+    // initConductoresTracking se llamará cuando el usuario inicie sesión como conductor
+    // No inicializar aquí para evitar listeners innecesarios
+    
+    // Configurar listeners de conexión/desconexión del socket
+    this.setupSocketConnectionListeners();
     
     // Listener para abrir modal de imagen desde popups
     this.imagePopupListener = (event: any) => {
@@ -189,6 +254,179 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
       }
     };
     window.addEventListener('openImageFromPopup', this.imagePopupListener);
+  }
+  
+  /**
+   * Restaura la sesión del usuario desde localStorage
+   */
+  private restaurarSesion(): void {
+    try {
+      const sesionGuardada = localStorage.getItem('sesionUsuario');
+      if (sesionGuardada) {
+        const sesionData = JSON.parse(sesionGuardada);
+        const { usuario, token } = sesionData;
+        
+        if (!usuario || !token) {
+          console.warn('⚠️ Datos de sesión incompletos');
+          localStorage.removeItem('sesionUsuario');
+          return;
+        }
+        
+        console.log('✅ Sesión encontrada en localStorage:', usuario.usuario);
+        
+        // IMPORTANTE: Validar token en el servidor para restaurar sesión
+        // Esperar a que el socket esté conectado
+        const socket = this.socketService.getSocket();
+        if (socket && socket.connected) {
+          this.validarTokenSesion(token);
+        } else {
+          // Si el socket no está conectado, esperar a que se conecte
+          console.log('⏳ Socket no conectado, esperando conexión para validar token...');
+          const checkConnection = setInterval(() => {
+            const socketCheck = this.socketService.getSocket();
+            if (socketCheck && socketCheck.connected) {
+              clearInterval(checkConnection);
+              this.validarTokenSesion(token);
+            }
+          }, 500);
+          
+          // Timeout de seguridad: si no se conecta en 10 segundos, restaurar solo localmente
+          setTimeout(() => {
+            clearInterval(checkConnection);
+            console.warn('⚠️ Timeout esperando conexión - restaurando sesión solo localmente');
+            this.restaurarSesionLocal(usuario);
+          }, 10000);
+        }
+      }
+    } catch (error) {
+      console.error('❌ Error al restaurar sesión:', error);
+      // Limpiar localStorage si hay error
+      localStorage.removeItem('sesionUsuario');
+    }
+  }
+  
+  /**
+   * Valida el token de sesión en el servidor
+   */
+  private validarTokenSesion(token: string): void {
+    const socket = this.socketService.getSocket();
+    if (!socket || !socket.connected) {
+      console.warn('⚠️ Socket no disponible para validar token');
+      return;
+    }
+    
+    console.log('🔄 Validando token de sesión en el servidor...');
+    
+    // Escuchar respuesta del servidor
+    const respuestaHandler = (respuesta: { success: boolean; usuario?: any; error?: string }) => {
+      socket.off('validar-token-respuesta', respuestaHandler);
+      
+      if (respuesta.success && respuesta.usuario) {
+        console.log('✅ Token válido - Sesión restaurada:', respuesta.usuario.usuario);
+        this.restaurarSesionLocal(respuesta.usuario);
+      } else {
+        console.warn('⚠️ Token inválido o expirado:', respuesta.error);
+        // Limpiar sesión inválida
+        localStorage.removeItem('sesionUsuario');
+        this.mostrarAlerta('Tu sesión ha expirado. Por favor, inicia sesión nuevamente.', 'warning');
+      }
+    };
+    
+    socket.on('validar-token-respuesta', respuestaHandler);
+    
+    // Enviar token al servidor para validación
+    socket.emit('validar-token', { token });
+  }
+  
+  /**
+   * Restaura la sesión solo localmente (sin hacer login en el servidor)
+   */
+  private restaurarSesionLocal(usuario: any): void {
+    this.usuarioLogueado = usuario;
+    console.log('✅ Sesión restaurada localmente:', usuario.usuario);
+    
+    // Inicializar recepción de ubicaciones de conductores
+    if (!this.conductorTrackingInitialized) {
+      console.log('👂 Inicializando recepción de ubicaciones de conductores (sesión restaurada)');
+      this.initConductoresTracking();
+    }
+    
+    // Si el usuario es conductor, reactivar transmisión
+    if (usuario.rol === 'conductor') {
+      console.log('🚗 Usuario conductor detectado - Reactivando transmisión');
+      
+      // Activar GPS si no está activo
+      if (!this.geoService.isTracking()) {
+        this.geoService.iniciarGPS().catch(error => {
+          console.error('❌ Error al reactivar GPS:', error);
+        });
+      }
+      
+      // Iniciar transmisión después de un breve delay
+      setTimeout(() => {
+        this.geoService.iniciarTransmisionConductor();
+      }, 500);
+    }
+    
+    this.cdr.markForCheck();
+  }
+
+  /**
+   * Configura listeners de conexión/desconexión del socket para conductores
+   */
+  private setupSocketConnectionListeners(): void {
+    // Listener para desconexión
+    window.addEventListener('socket-disconnected', (event: any) => {
+      const reason = event.detail?.reason || 'Desconocido';
+      console.warn('⚠️ Socket desconectado:', reason);
+      
+      // Si es conductor, avisar y detener transmisión
+      if (this.usuarioLogueado?.rol === 'conductor') {
+        this.mostrarAlerta('⚠️ Conexión perdida. La transmisión de ubicación se ha detenido.', 'warning');
+        this.geoService.detenerTransmisionConductor();
+        this.cdr.markForCheck();
+      }
+    });
+    
+    // Listener para reconexión
+    window.addEventListener('socket-reconnected', (event: any) => {
+      const attemptNumber = event.detail?.attemptNumber || 0;
+      console.log('✅ Socket reconectado después de', attemptNumber, 'intentos');
+      
+      // Si es conductor, reanudar transmisión automáticamente
+      if (this.usuarioLogueado?.rol === 'conductor') {
+        console.log('🚗 Reconexión detectada - REANUDANDO TRANSMISIÓN para conductor');
+        this.mostrarAlerta('✅ Conexión restaurada. Transmisión de ubicación reanudada automáticamente.', 'success');
+        
+        // PRINCIPIO RECTOR: Reanudar transmisión inmediatamente
+        // El geoService automáticamente reenviará la última coordenada válida
+        this.geoService.iniciarTransmisionConductor();
+        
+        // Asegurar que el GPS siga funcionando (no debería haberse detenido)
+        if (!this.geoService.isTracking()) {
+          console.log('📍 Reactivando GPS para conductor');
+          this.geoService.iniciarGPS();
+        }
+        
+        this.cdr.markForCheck();
+      }
+    });
+  }
+
+  /**
+   * Limpia todos los marcadores de conductores del mapa
+   */
+  private limpiarMarcadoresConductores(): void {
+    Object.values(this.conductoresMarkers).forEach(marker => {
+      if (marker) {
+        marker.remove();
+      }
+    });
+    this.conductoresMarkers = {};
+    this.conductoresLastPositions.clear();
+    this.conductoresUsuarios.clear();
+    console.log('🧹 Marcadores de conductores limpiados');
+    this.cdr.markForCheck();
   }
 
   ngOnDestroy(): void {
@@ -199,6 +437,10 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     if (this.imagePopupListener) {
       window.removeEventListener('openImageFromPopup', this.imagePopupListener);
     }
+    
+    // Remover listeners de socket
+    window.removeEventListener('socket-disconnected', () => {});
+    window.removeEventListener('socket-reconnected', () => {});
     
     // Detener geolocalización
     this.geoService.stopTracking();
@@ -211,7 +453,12 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
       cancelAnimationFrame(this.smoothMoveAnimation);
     }
 
-    // Limpiar marcadores de usuarios - ELIMINADO (solo marcador local)
+    // Limpiar marcadores de conductores
+    Object.values(this.conductoresMarkers).forEach(marker => {
+      marker.remove();
+    });
+    this.conductoresMarkers = {};
+    this.conductoresLastPositions.clear();
 
     // Limpiar marcadores guardados
     this.savedMarkers.forEach(marker => {
@@ -228,9 +475,17 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     this.socketSubscriptions.forEach(sub => sub.unsubscribe());
     this.socketSubscriptions = [];
 
-    // Limpiar listeners de notificaciones de conductores
+    // Limpiar todos los listeners de socket (usar una sola variable)
     const socket = this.socketService.getSocket();
     if (socket) {
+      // Remover listener de ubicaciones de conductores
+      if (this.conductorLocationHandler) {
+        socket.off('ubicacion-conductor', this.conductorLocationHandler);
+        this.conductorLocationHandler = undefined;
+        this.conductorTrackingInitialized = false;
+      }
+      
+      // Remover listeners de notificaciones de conductores
       if ((this as any).notificacionConductorHandler) {
         socket.off('notificacion-conductor', (this as any).notificacionConductorHandler);
       }
@@ -660,6 +915,7 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
 
     this.searchInProgress = true;
     this.searchError = null;
+    this.cdr.markForCheck(); // Forzar detección de cambios
 
     try {
       const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`;
@@ -675,12 +931,14 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
         this.searchQuery = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
         this.searchResultValid = true;
         this.searchResults = [];
+        this.cdr.markForCheck(); // Forzar detección de cambios
         return;
       }
 
       this.searchQuery = this.formatReverseAddress(data, lat, lng);
       this.searchResults = [];
       this.searchResultValid = true;
+      this.cdr.markForCheck(); // Forzar detección de cambios
     } catch (error) {
       console.error('Error en reverse geocoding:', error);
       // En caso de error, mostrar coordenadas
@@ -688,8 +946,10 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
       this.searchQuery = `${lngLat.lat.toFixed(6)}, ${lngLat.lng.toFixed(6)}`;
       this.searchResultValid = true;
       this.searchError = null;
+      this.cdr.markForCheck(); // Forzar detección de cambios
     } finally {
       this.searchInProgress = false;
+      this.cdr.markForCheck(); // Forzar detección de cambios
     }
   }
 
@@ -977,6 +1237,7 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
 
     // Abrir modal
     this.modalMarcadorAbierto = true;
+    this.cdr.markForCheck(); // Forzar detección de cambios para mostrar el modal
   }
 
   /**
@@ -1107,6 +1368,7 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     // NO limpiar coordenadasMarcador para evitar que afecte el marcador draggable
     // NO mover el mapa
     // NO cambiar la posición del marcador draggable
+    this.cdr.markForCheck(); // Forzar detección de cambios
   }
 
   /**
@@ -1199,7 +1461,43 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
    * Guarda el marcador en el servidor
    */
   guardarMarcador(): void {
-    if (!this.coordenadasMarcador || !this.selectedCategory || !this.descripcionMarcador.trim() || this.descripcionMarcador.trim().length < 10) {
+    // VALIDACIÓN COMPLETA con mensajes de error claros
+    if (!this.coordenadasMarcador) {
+      this.mostrarAlerta('Error: No hay coordenadas seleccionadas. Por favor, arrastra el marcador en el mapa.', 'error');
+      this.cdr.markForCheck();
+      return;
+    }
+
+    if (!this.selectedCategory) {
+      this.mostrarAlerta('Error: Debes seleccionar una categoría.', 'error');
+      this.cdr.markForCheck();
+      return;
+    }
+
+    const descripcionTrimmed = this.descripcionMarcador.trim();
+    if (!descripcionTrimmed) {
+      this.mostrarAlerta('Error: La descripción no puede estar vacía.', 'error');
+      this.cdr.markForCheck();
+      return;
+    }
+
+    if (descripcionTrimmed.length < 10) {
+      this.mostrarAlerta('Error: La descripción debe tener al menos 10 caracteres.', 'error');
+      this.cdr.markForCheck();
+      return;
+    }
+
+    // Validar coordenadas válidas
+    if (!Number.isFinite(this.coordenadasMarcador.lat) || !Number.isFinite(this.coordenadasMarcador.lng)) {
+      this.mostrarAlerta('Error: Las coordenadas no son válidas.', 'error');
+      this.cdr.markForCheck();
+      return;
+    }
+
+    if (this.coordenadasMarcador.lat < -90 || this.coordenadasMarcador.lat > 90 || 
+        this.coordenadasMarcador.lng < -180 || this.coordenadasMarcador.lng > 180) {
+      this.mostrarAlerta('Error: Las coordenadas están fuera de rango válido.', 'error');
+      this.cdr.markForCheck();
       return;
     }
 
@@ -1207,7 +1505,7 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
       lat: this.coordenadasMarcador.lat,
       lng: this.coordenadasMarcador.lng,
       categoria: this.selectedCategory,
-      descripcion: this.descripcionMarcador.trim()
+      descripcion: descripcionTrimmed
     };
 
     // Activar loading
@@ -1218,6 +1516,8 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     this.apiService.createMarcador(marcadorData, this.archivoSeleccionado || undefined).subscribe({
       next: (response) => {
         this.loadingVisible = false;
+        this.cdr.markForCheck(); // Forzar detección de cambios
+        
         if (response.success && response.data) {
           console.log('Marcador guardado en servidor:', response.data);
           
@@ -1226,9 +1526,6 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
           const currentMapCenter = this.map?.getCenter();
           const currentMapZoom = this.map?.getZoom();
           const currentSearchMarkerPos = this.searchMarker?.getLngLat();
-          
-          // Cerrar modal y limpiar formulario
-          this.cerrarModalMarcador();
           
           // Si hay marcadores cargados en el mapa, agregar el nuevo marcador en tiempo real
           if (this.savedMarkers.length > 0 && response.data) {
@@ -1291,14 +1588,32 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
             // Si no hay marcadores cargados, solo mostrar mensaje
             this.mostrarAlerta('Marcador guardado exitosamente en el servidor', 'success');
           }
+          
+          // Cerrar modal y limpiar formulario DESPUÉS de mostrar el mensaje
+          this.cerrarModalMarcador();
         } else {
           this.mostrarAlerta('Error al guardar: ' + (response.error || 'Error desconocido'), 'error');
+          this.cdr.markForCheck();
         }
       },
       error: (error) => {
         this.loadingVisible = false;
         console.error('Error al guardar en servidor:', error);
-        this.mostrarAlerta('Error al guardar el marcador. Verifica la conexión al servidor.', 'error');
+        
+        // Mensaje de error más descriptivo
+        let mensajeError = 'Error al guardar el marcador. ';
+        if (error.status === 0) {
+          mensajeError += 'No se pudo conectar al servidor. Verifica que el servidor esté ejecutándose.';
+        } else if (error.status === 400) {
+          mensajeError += 'Datos inválidos: ' + (error.error?.error || 'Verifica los datos ingresados.');
+        } else if (error.status === 500) {
+          mensajeError += 'Error interno del servidor. Intenta nuevamente.';
+        } else {
+          mensajeError += 'Error de conexión. Intenta nuevamente.';
+        }
+        
+        this.mostrarAlerta(mensajeError, 'error');
+        this.cdr.markForCheck();
       }
     });
   }
@@ -1313,24 +1628,41 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     this.loadingMensaje = 'Cargando marcadores...';
     this.modalGestionMarcadoresAbierto = true;
 
+    // OPTIMIZACIÓN: Usar NgZone para actualizar fuera del ciclo de detección
     this.apiService.getMarcadores().subscribe({
       next: (response) => {
-        this.cargandoMarcadores = false;
-        this.loadingVisible = false;
-        if (response.success && response.data) {
-          this.marcadoresGuardados = response.data;
-          if (this.marcadoresGuardados.length === 0) {
-            this.mostrarAlerta('No hay marcadores guardados en el servidor', 'info');
+        // Ejecutar fuera de Angular para mejor rendimiento
+        this.ngZone.runOutsideAngular(() => {
+          if (response.success && response.data) {
+            // Asignar datos
+            this.marcadoresGuardados = response.data;
+            
+            // Ejecutar dentro de Angular solo para actualizar la vista
+            this.ngZone.run(() => {
+              this.cargandoMarcadores = false;
+              this.loadingVisible = false;
+              this.cdr.markForCheck(); // Forzar detección de cambios con OnPush
+              
+              if (this.marcadoresGuardados.length === 0) {
+                this.mostrarAlerta('No hay marcadores guardados en el servidor', 'info');
+              }
+            });
+          } else {
+            this.ngZone.run(() => {
+              this.cargandoMarcadores = false;
+              this.loadingVisible = false;
+              this.mostrarAlerta('Error al cargar marcadores: ' + (response.error || 'Error desconocido'), 'error');
+            });
           }
-        } else {
-          this.mostrarAlerta('Error al cargar marcadores: ' + (response.error || 'Error desconocido'), 'error');
-        }
+        });
       },
       error: (error) => {
-        this.cargandoMarcadores = false;
-        this.loadingVisible = false;
-        console.error('Error al cargar marcadores:', error);
-        this.mostrarAlerta('Error al conectar con el servidor. Verifica que el servidor esté ejecutándose.', 'error');
+        this.ngZone.run(() => {
+          this.cargandoMarcadores = false;
+          this.loadingVisible = false;
+          console.error('Error al cargar marcadores:', error);
+          this.mostrarAlerta('Error al conectar con el servidor. Verifica que el servidor esté ejecutándose.', 'error');
+        });
       }
     });
   }
@@ -1341,6 +1673,14 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
   cerrarModalGestionMarcadores(): void {
     this.modalGestionMarcadoresAbierto = false;
     this.marcadoresGuardados = [];
+    this.cdr.markForCheck(); // Forzar detección de cambios
+  }
+
+  /**
+   * TrackBy function para optimizar *ngFor de marcadores
+   */
+  trackByMarcadorId(index: number, marcador: Marcador): string {
+    return marcador.id || index.toString();
   }
 
   /**
@@ -1363,83 +1703,115 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     this.loadingVisible = true;
     this.loadingMensaje = 'Cargando marcadores en el mapa...';
 
-    // Crear y agregar marcadores al mapa
-    console.log(this.marcadoresGuardados);
+    // OPTIMIZACIÓN: Procesar marcadores en lotes usando requestAnimationFrame para mejor rendimiento
     const bounds: maplibregl.LngLatBounds = new maplibregl.LngLatBounds();
+    const marcadores = this.marcadoresGuardados;
+    const totalMarcadores = marcadores.length;
+    let indiceActual = 0;
+    const BATCH_SIZE = 50; // Procesar 50 marcadores por frame
     
-    this.marcadoresGuardados.forEach((marcadorData) => {
-      const icono = this.categoryIcons[marcadorData.categoria];
-      if (!icono) return;
-
-      // Clonar el elemento para cada marcador
-      const iconoClone = icono.cloneNode(true) as HTMLElement;
+    const procesarLote = () => {
+      const finLote = Math.min(indiceActual + BATCH_SIZE, totalMarcadores);
       
-      const marker = new Marker({
-        element: iconoClone
-      })
-        .setLngLat([marcadorData.lng, marcadorData.lat])
-        .addTo(this.map!);
+      for (let i = indiceActual; i < finLote; i++) {
+        const marcadorData = marcadores[i];
+        const icono = this.categoryIcons[marcadorData.categoria];
+        if (!icono) continue;
 
-      // Crear contenido del popup
-      const categoriaNombre = this.getCategoryName(marcadorData.categoria);
-      const fecha = marcadorData.timestamp 
-        ? new Date(marcadorData.timestamp).toLocaleString('es-ES')
-        : 'Fecha no disponible';
-      
-      let popupContent = `
-        <div class="popup-content" style="min-width: 200px;">
-          <h3 style="margin: 0 0 8px 0; font-weight: bold; color: #1f2937;">
-            ${categoriaNombre}
-          </h3>
-          <p style="margin: 0 0 8px 0; color: #4b5563;">${marcadorData.descripcion}</p>
-          <div style="margin: 8px 0; padding: 8px; background: #f3f4f6; border-radius: 4px;">
-            <p style="margin: 0; font-size: 11px; color: #6b7280;">
-              <strong>Coordenadas:</strong><br>
-              ${marcadorData.lat.toFixed(6)}, ${marcadorData.lng.toFixed(6)}
-            </p>
-            <p style="margin: 4px 0 0 0; font-size: 11px; color: #6b7280;">
-              <strong>Fecha:</strong> ${fecha}
-            </p>
-          </div>
-      `;
+        // Clonar el elemento para cada marcador
+        const iconoClone = icono.cloneNode(true) as HTMLElement;
+        
+        const marker = new Marker({
+          element: iconoClone
+        })
+          .setLngLat([marcadorData.lng, marcadorData.lat])
+          .addTo(this.map!);
 
-      // Si hay archivo adjunto y es una imagen, mostrarla directamente
-      if (marcadorData.archivo && this.isImage(marcadorData.archivo)) {
-        const archivoUrl = this.getFileUrl(marcadorData.archivo);
-        if (archivoUrl) {
-          // Escapar comillas simples en la URL para evitar problemas en el atributo onclick
-          const escapedUrl = archivoUrl.replace(/'/g, "\\'");
-          popupContent += `
-            <div style="margin-top: 8px;">
-              <img src="${archivoUrl}" 
-                   alt="Imagen adjunta" 
-                   class="w-20 h-20 object-cover rounded-md cursor-pointer"
-                   onclick="window.dispatchEvent(new CustomEvent('openImageFromPopup', { detail: '${escapedUrl}' }))"
-                   style="max-width: 200px; max-height: 150px; border-radius: 4px; object-fit: cover; display: block; cursor: pointer;">
-            </div>
+        // OPTIMIZACIÓN: Crear popup de forma lazy (solo cuando se abre)
+        const popup = new Popup({ offset: 25 });
+        
+        // Función para generar contenido del popup solo cuando se necesite
+        const generarPopupContent = () => {
+          const categoriaNombre = this.getCategoryName(marcadorData.categoria);
+          const fecha = marcadorData.timestamp 
+            ? new Date(marcadorData.timestamp).toLocaleString('es-ES')
+            : 'Fecha no disponible';
+          
+          let popupContent = `
+            <div class="popup-content" style="min-width: 200px;">
+              <h3 style="margin: 0 0 8px 0; font-weight: bold; color: #1f2937;">
+                ${categoriaNombre}
+              </h3>
+              <p style="margin: 0 0 8px 0; color: #4b5563;">${marcadorData.descripcion}</p>
+              <div style="margin: 8px 0; padding: 8px; background: #f3f4f6; border-radius: 4px;">
+                <p style="margin: 0; font-size: 11px; color: #6b7280;">
+                  <strong>Coordenadas:</strong><br>
+                  ${marcadorData.lat.toFixed(6)}, ${marcadorData.lng.toFixed(6)}
+                </p>
+                <p style="margin: 4px 0 0 0; font-size: 11px; color: #6b7280;">
+                  <strong>Fecha:</strong> ${fecha}
+                </p>
+              </div>
           `;
-        }
+
+          // Si hay archivo adjunto y es una imagen, mostrarla directamente
+          if (marcadorData.archivo && this.isImage(marcadorData.archivo)) {
+            const archivoUrl = this.getFileUrl(marcadorData.archivo);
+            if (archivoUrl) {
+              const escapedUrl = archivoUrl.replace(/'/g, "\\'");
+              popupContent += `
+                <div style="margin-top: 8px;">
+                  <img src="${archivoUrl}" 
+                       alt="Imagen adjunta" 
+                       class="w-20 h-20 object-cover rounded-md cursor-pointer"
+                       onclick="window.dispatchEvent(new CustomEvent('openImageFromPopup', { detail: '${escapedUrl}' }))"
+                       style="max-width: 200px; max-height: 150px; border-radius: 4px; object-fit: cover; display: block; cursor: pointer;">
+                </div>
+              `;
+            }
+          }
+
+          popupContent += `</div>`;
+          return popupContent;
+        };
+        
+        // Asignar popup con contenido lazy
+        popup.setHTML(generarPopupContent());
+        marker.setPopup(popup);
+        
+        // Guardar datos del marcador para referencia
+        (marker as any).marcadorData = marcadorData;
+        
+        this.savedMarkers.push(marker);
+        bounds.extend([marcadorData.lng, marcadorData.lat]);
       }
-
-      popupContent += `</div>`;
-
-      const popup = new Popup({ offset: 25 })
-        .setHTML(popupContent);
       
-      marker.setPopup(popup);
+      indiceActual = finLote;
       
-      // Guardar datos del marcador para referencia
-      (marker as any).marcadorData = marcadorData;
-      
-      this.savedMarkers.push(marker);
-      bounds.extend([marcadorData.lng, marcadorData.lat]);
-    });
+      // Actualizar loading message
+      if (indiceActual < totalMarcadores) {
+        this.loadingMensaje = `Cargando marcadores... ${indiceActual}/${totalMarcadores}`;
+        // Continuar procesando en el siguiente frame
+        requestAnimationFrame(procesarLote);
+      } else {
+        // Terminado - ajustar vista del mapa
+        this.finalizarCargaMarcadores(bounds, cantidad_marcadores);
+      }
+    };
+    
+    // Iniciar procesamiento
+    procesarLote();
+  }
 
-    // Ajustar vista del mapa para mostrar todos los marcadores
+  /**
+   * Finaliza la carga de marcadores y ajusta la vista
+   */
+  private finalizarCargaMarcadores(bounds: maplibregl.LngLatBounds, cantidad_marcadores: number): void {
+    // Ajustar vista del mapa SIN animación para mayor velocidad
     if (this.savedMarkers.length > 0 && bounds.getNorth() !== bounds.getSouth()) {
       this.map!.fitBounds(bounds, {
         padding: 50,
-        duration: 600
+        duration: 0 // OPTIMIZACIÓN: Sin animación para mayor velocidad
       });
     }
 
@@ -1450,6 +1822,9 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
 
     // Inicializar listeners de socket para tiempo real (solo si hay marcadores cargados)
     this.initSocketListeners();
+    
+    // Forzar detección de cambios
+    this.cdr.markForCheck();
   }
 
   /**
@@ -1913,6 +2288,21 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
         } else if (data.tipo === 'inactivo') {
           this.notificationService.pushNotification(data.mensaje, 'warning');
           this.mostrarAlerta(data.mensaje, 'warning');
+          
+          // IMPORTANTE: Eliminar el marcador del conductor inactivo
+          // Buscar el conductorId asociado al usuario
+          const conductorId = this.conductoresUsuarios.get(data.usuario);
+          if (conductorId && this.conductoresMarkers[conductorId]) {
+            console.log(`🗑️ Eliminando marcador de conductor inactivo: ${data.usuario} (ID: ${conductorId})`);
+            const marker = this.conductoresMarkers[conductorId];
+            marker.remove();
+            delete this.conductoresMarkers[conductorId];
+            this.conductoresLastPositions.delete(conductorId);
+            this.conductoresUsuarios.delete(data.usuario);
+            this.cdr.markForCheck();
+          } else {
+            console.warn(`⚠️ No se encontró marcador para conductor inactivo: ${data.usuario}`);
+          }
         }
       };
       
@@ -1949,56 +2339,436 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
    */
 
   /**
+   * Valida y convierte coordenadas de manera estricta
+   * SOLO acepta números válidos y los convierte explícitamente
+   * Retorna { lat, lng } válidos o null si debe descartarse
+   */
+  private validarYConvertirCoordenadas(lat: any, lng: any): { lat: number; lng: number } | null {
+    // CAPA 1: Verificar existencia
+    if (lat === undefined || lat === null || lng === undefined || lng === null) {
+      return null;
+    }
+
+    // CAPA 2: Intentar conversión a número (maneja strings numéricos)
+    let latNum: number;
+    let lngNum: number;
+
+    // Convertir explícitamente a número
+    if (typeof lat === 'string') {
+      latNum = parseFloat(lat);
+    } else if (typeof lat === 'number') {
+      latNum = lat;
+    } else {
+      return null; // Tipo no soportado
+    }
+
+    if (typeof lng === 'string') {
+      lngNum = parseFloat(lng);
+    } else if (typeof lng === 'number') {
+      lngNum = lng;
+    } else {
+      return null; // Tipo no soportado
+    }
+
+    // CAPA 3: Verificar que la conversión resultó en números finitos
+    if (!Number.isFinite(latNum) || !Number.isFinite(lngNum)) {
+      return null;
+    }
+
+    // CAPA 4: Rechazar punto nulo (0, 0)
+    if (latNum === 0 && lngNum === 0) {
+      return null;
+    }
+
+    // CAPA 5: Validar rangos estrictos
+    if (latNum < -90 || latNum > 90 || lngNum < -180 || lngNum > 180) {
+      return null;
+    }
+
+    // CAPA 6: Verificar que no sean valores extremadamente pequeños (casi cero pero no exactamente cero)
+    if (Math.abs(latNum) < 0.000001 && Math.abs(lngNum) < 0.000001) {
+      return null;
+    }
+
+    // Coordenadas válidas
+    return { lat: latNum, lng: lngNum };
+  }
+
+  /**
    * Sanitiza y valida coordenadas GPS estrictamente
    * Retorna coordenada válida o null si debe descartarse
    */
   private sanitizeLocation(data: { lat: number; lng: number; accuracy?: number | null }): { lat: number; lng: number; accuracy?: number | null } | null {
-    // Validar que lat y lng existan y sean números finitos
-    if (!Number.isFinite(data.lat) || !Number.isFinite(data.lng)) {
-      console.warn('⚠️ Coordenada inválida: lat o lng no es un número finito', data);
-      return null;
-    }
-
-    const lat = data.lat;
-    const lng = data.lng;
-
-    // Rechazar coordenadas (0, 0) - punto nulo
-    if (lat === 0 && lng === 0) {
-      console.warn('⚠️ Coordenada inválida: punto nulo (0, 0)', data);
-      return null;
-    }
-
-    // Validar rangos de latitud y longitud
-    if (lat < -90 || lat > 90) {
-      console.warn('⚠️ Coordenada inválida: latitud fuera de rango', { lat, lng });
-      return null;
-    }
-
-    if (lng < -180 || lng > 180) {
-      console.warn('⚠️ Coordenada inválida: longitud fuera de rango', { lat, lng });
+    // Usar la función de validación centralizada
+    const coordenadasValidas = this.validarYConvertirCoordenadas(data.lat, data.lng);
+    if (!coordenadasValidas) {
       return null;
     }
 
     // Validar accuracy si existe: descartar si es > 200 metros
     if (data.accuracy !== undefined && data.accuracy !== null) {
-      if (!Number.isFinite(data.accuracy) || data.accuracy > 200) {
-        console.warn('⚠️ Coordenada descartada: precisión GPS muy baja (>200m)', { lat, lng, accuracy: data.accuracy });
+      const accuracyNum = typeof data.accuracy === 'string' ? parseFloat(data.accuracy) : data.accuracy;
+      if (!Number.isFinite(accuracyNum) || accuracyNum > 200) {
         return null;
       }
+      return {
+        lat: coordenadasValidas.lat,
+        lng: coordenadasValidas.lng,
+        accuracy: accuracyNum
+      };
     }
 
-    // Coordenada válida
     return {
-      lat,
-      lng,
+      lat: coordenadasValidas.lat,
+      lng: coordenadasValidas.lng,
       accuracy: data.accuracy
     };
   }
 
   /**
-   * Pinta o actualiza la ubicación de un usuario en el mapa - ELIMINADO
-   * Solo se mantiene el marcador local y draggable
+   * Inicializa el sistema de tracking de conductores
    */
+  private initConductoresTracking(): void {
+    // Evitar inicialización múltiple
+    if (this.conductorTrackingInitialized) {
+      console.warn('⚠️ initConductoresTracking ya fue inicializado, evitando duplicado');
+      return;
+    }
+
+    const socket = this.socketService.getSocket();
+    if (!socket) {
+      console.error('❌ No se puede inicializar tracking de conductores: socket no disponible');
+      return;
+    }
+
+    if (!socket.connected) {
+      console.warn('⚠️ Socket no conectado - El tracking se activará al reconectar');
+      // Aún así registrar el listener para cuando se reconecte
+    }
+    
+    // Crear handler una sola vez y guardar referencia
+    // OPTIMIZACIÓN: Usar NgZone.run para actualizaciones fuera de Angular
+    this.conductorLocationHandler = (data: any) => {
+      console.log('📥 Ubicación de conductor recibida:', data);
+      // Ejecutar fuera de Angular para máxima velocidad
+      this.ngZone.runOutsideAngular(() => {
+        this.procesarUbicacionConductor(data);
+      });
+    };
+    
+    // Registrar listener
+    socket.on('ubicacion-conductor', this.conductorLocationHandler);
+    this.conductorTrackingInitialized = true;
+    console.log('✅ Sistema de tracking de conductores inicializado - Listo para recibir ubicaciones');
+  }
+
+  /**
+   * Procesa ubicación de conductor - OPTIMIZADO para máxima velocidad
+   */
+  private procesarUbicacionConductor(data: any): void {
+    try {
+        // VALIDACIÓN ESTRICTA DE ESTRUCTURA DE DATOS
+        if (!data || typeof data !== 'object') {
+          console.warn('⚠️ Datos de ubicación de conductor inválidos: no es un objeto', data);
+          return;
+        }
+
+        // Validar conductorId
+        if (!data.conductorId || typeof data.conductorId !== 'string' || data.conductorId.trim() === '') {
+          console.warn('⚠️ Datos de ubicación de conductor inválidos: conductorId faltante o inválido', data);
+          return;
+        }
+
+        // Validar usuario
+        if (!data.usuario || typeof data.usuario !== 'string' || data.usuario.trim() === '') {
+          console.warn('⚠️ Datos de ubicación de conductor inválidos: usuario faltante o inválido', data);
+          return;
+        }
+
+        // Verificar que no sea el usuario actual (el conductor no debe recibir su propia ubicación)
+        if (this.usuarioLogueado && this.usuarioLogueado.usuario === data.usuario) {
+          return; // Ignorar propia ubicación
+        }
+
+        // VALIDACIÓN ESTRICTA DE COORDENADAS USANDO FUNCIÓN CENTRALIZADA
+        const coordenadasValidas = this.validarYConvertirCoordenadas(data.lat, data.lng);
+        
+        if (!coordenadasValidas) {
+          console.warn(`⚠️ Coordenadas inválidas descartadas para conductor ${data.usuario}:`, { 
+            lat: data.lat, 
+            lng: data.lng, 
+            tipoLat: typeof data.lat, 
+            tipoLng: typeof data.lng 
+          });
+          return;
+        }
+
+        // Validar accuracy si existe
+        if (data.accuracy !== undefined && data.accuracy !== null) {
+          const accuracyNum = typeof data.accuracy === 'string' ? parseFloat(data.accuracy) : data.accuracy;
+          if (!Number.isFinite(accuracyNum) || accuracyNum > 200) {
+            console.warn(`⚠️ Precisión GPS muy baja para conductor ${data.usuario}:`, { accuracy: data.accuracy });
+            return;
+          }
+        }
+
+        // Crear objeto con coordenadas validadas y convertidas
+        const datosValidados = {
+          ...data,
+          lat: coordenadasValidas.lat,
+          lng: coordenadasValidas.lng
+        };
+
+        // Si llegamos aquí, los datos son válidos - procesar INMEDIATAMENTE
+        // Ejecutar dentro de NgZone solo para actualizar marcador
+        this.ngZone.run(() => {
+          this.pintarOActualizarConductor(datosValidados);
+        });
+      } catch (error) {
+        console.error('❌ Error al procesar ubicación de conductor:', error, data);
+      }
+  }
+
+  /**
+   * Pinta o actualiza la ubicación de un conductor en el mapa
+   * IMPORTANTE: Esta función asume que los datos ya fueron validados en initConductoresTracking()
+   */
+  private pintarOActualizarConductor(data: { conductorId: string; usuario: string; lat: number; lng: number; speed: number; timestamp: number; accuracy?: number }): void {
+    if (!this.map) {
+      console.warn('⚠️ Mapa no inicializado, no se puede pintar conductor');
+      return;
+    }
+
+    const { conductorId, usuario, speed } = data;
+
+    // VALIDACIÓN FINAL USANDO FUNCIÓN CENTRALIZADA (doble verificación)
+    const coordenadasValidas = this.validarYConvertirCoordenadas(data.lat, data.lng);
+    
+    if (!coordenadasValidas) {
+      console.error(`❌ ERROR CRÍTICO: Coordenadas inválidas en pintarOActualizarConductor para ${usuario}:`, { 
+        lat: data.lat, 
+        lng: data.lng,
+        tipoLat: typeof data.lat,
+        tipoLng: typeof data.lng
+      });
+      return;
+    }
+
+    // Extraer valores finales (ya validados y convertidos)
+    const finalLat = coordenadasValidas.lat;
+    const finalLng = coordenadasValidas.lng;
+    const newPos = { lat: finalLat, lng: finalLng };
+    const newLngLat: [number, number] = [finalLng, finalLat]; // MapLibre usa [lng, lat]
+
+    // Si no existe el marcador, crearlo
+    if (!this.conductoresMarkers[conductorId]) {
+      // VALIDACIÓN FINAL antes de crear
+      if (!Number.isFinite(finalLat) || !Number.isFinite(finalLng)) {
+        console.error(`❌ ERROR CRÍTICO: No se puede crear marcador - coordenadas inválidas para ${usuario}`);
+        return;
+      }
+
+      try {
+        // Crear icono tipo Waze para el conductor (clonar el elemento base)
+        const iconElement = this.iconCarroElement.cloneNode(true) as HTMLElement;
+        
+        // Asegurar que el elemento tenga dimensiones válidas
+        iconElement.style.width = '40px';
+        iconElement.style.height = '40px';
+        iconElement.style.position = 'relative';
+        iconElement.style.display = 'flex';
+        iconElement.style.alignItems = 'center';
+        iconElement.style.justifyContent = 'center';
+        // SIN transiciones ni animaciones - actualización directa
+        iconElement.style.transition = 'none';
+        iconElement.style.animation = 'none';
+        // SIN transiciones ni animaciones - actualización directa
+        iconElement.style.transition = 'none';
+        iconElement.style.animation = 'none';
+
+        // Crear marcador con ancla en el centro
+        const marker = new Marker({
+          element: iconElement,
+          anchor: 'center' // Anclar en el centro del icono
+        });
+
+        // VALIDACIÓN FINAL de coordenadas antes de establecer posición
+        if (!Number.isFinite(finalLat) || !Number.isFinite(finalLng)) {
+          console.error(`❌ ERROR: Coordenadas no finitas al crear marcador para ${usuario}`, { finalLat, finalLng });
+          return;
+        }
+
+        // VALIDACIÓN EXTRA: Verificar que newLngLat sea un array válido
+        if (!Array.isArray(newLngLat) || newLngLat.length !== 2) {
+          console.error(`❌ ERROR: newLngLat no es un array válido para ${usuario}:`, newLngLat);
+          return;
+        }
+
+        // VALIDACIÓN EXTRA: Verificar que los valores del array sean números finitos
+        if (!Number.isFinite(newLngLat[0]) || !Number.isFinite(newLngLat[1])) {
+          console.error(`❌ ERROR: Valores en newLngLat no son finitos para ${usuario}:`, newLngLat);
+          return;
+        }
+
+        // VALIDACIÓN EXTRA: Verificar que no sean (0, 0)
+        if (newLngLat[0] === 0 && newLngLat[1] === 0) {
+          console.error(`❌ ERROR: newLngLat es (0, 0) para ${usuario}`);
+          return;
+        }
+
+        // Establecer posición ANTES de agregar al mapa (esto es crítico)
+        try {
+          marker.setLngLat(newLngLat);
+          
+          // VERIFICACIÓN POST-SET: Verificar que la posición se estableció correctamente
+          const posVerificada = marker.getLngLat();
+          if (!posVerificada || 
+              !Number.isFinite(posVerificada.lat) || 
+              !Number.isFinite(posVerificada.lng) ||
+              (posVerificada.lat === 0 && posVerificada.lng === 0)) {
+            console.error(`❌ ERROR CRÍTICO: Posición inválida después de setLngLat inicial para ${usuario}:`, { 
+              esperado: newLngLat, 
+              obtenido: posVerificada 
+            });
+            return;
+          }
+        } catch (error) {
+          console.error(`❌ ERROR al establecer posición inicial del marcador para ${usuario}:`, error, { newLngLat, finalLat, finalLng });
+          return;
+        }
+        
+        // Agregar al mapa
+        marker.addTo(this.map);
+
+        // Guardar referencia
+        this.conductoresMarkers[conductorId] = marker;
+        // Guardar asociación usuario -> conductorId para poder eliminar cuando se recibe notificación inactivo
+        this.conductoresUsuarios.set(usuario, conductorId);
+        
+        // Agregar popup con información del conductor
+        // IMPORTANTE: closeOnClick: false y closeOnMove: false para que no se cierre automáticamente
+        const speedKmh = (speed && Number.isFinite(speed)) ? (speed * 3.6).toFixed(1) : '0.0';
+        const popup = new Popup({ 
+          offset: 25,
+          closeOnClick: false, // No cerrar al hacer clic en el mapa
+          closeOnMove: false, // No cerrar al mover el mapa
+          closeButton: true, // Mostrar botón de cerrar
+          maxWidth: '300px'
+        })
+          .setHTML(`
+            <div style="min-width: 150px; pointer-events: auto;" onclick="event.stopPropagation();">
+              <strong>🚗 Conductor: ${usuario}</strong><br>
+              <small>Velocidad: ${speedKmh} km/h</small>
+            </div>
+          `);
+        
+        // Prevenir que el popup se cierre al hacer clic en el mapa
+        marker.setPopup(popup);
+        
+        // Agregar listener para prevenir el cierre del popup
+        marker.on('click', (e) => {
+          e.originalEvent?.stopPropagation();
+        });
+        
+        // Guardar última posición válida para rotación
+        this.conductoresLastPositions.set(conductorId, newPos);
+        
+        console.log(`✅ Marcador de conductor creado: ${usuario} en [${finalLat}, ${finalLng}]`);
+      } catch (error) {
+        console.error(`❌ Error al crear marcador de conductor ${usuario}:`, error);
+        // No crear el marcador si hay error
+        return;
+      }
+    } else {
+      // Actualizar marcador existente
+      const marker = this.conductoresMarkers[conductorId];
+      
+      // Obtener última posición válida
+      const lastPos = this.conductoresLastPositions.get(conductorId);
+      
+      // VALIDACIÓN FINAL antes de actualizar
+      if (!Number.isFinite(finalLat) || !Number.isFinite(finalLng)) {
+        console.error(`❌ ERROR CRÍTICO: No se puede actualizar marcador - coordenadas inválidas para ${usuario}`, { finalLat, finalLng });
+        // NO actualizar si las coordenadas son inválidas - mantener última posición válida
+        return;
+      }
+
+      try {
+
+        // Verificar que el marcador existe y es válido
+        if (!marker || !marker.getElement()) {
+          console.error(`❌ ERROR: Marcador no válido para ${usuario}`);
+          return;
+        }
+
+        // Actualizar posición del marcador DIRECTAMENTE sin animaciones ni suavizado
+        // ACTUALIZACIÓN INSTANTÁNEA - SIN INTERPOLACIÓN, SIN ANIMACIONES, SIN SUAVIZADO
+        try {
+          marker.setLngLat(newLngLat);
+          
+          // Verificar que la posición se estableció correctamente
+          const currentLngLat = marker.getLngLat();
+          if (!currentLngLat || 
+              !Number.isFinite(currentLngLat.lat) || 
+              !Number.isFinite(currentLngLat.lng) ||
+              currentLngLat.lat === 0 && currentLngLat.lng === 0) {
+            console.error(`❌ ERROR: Posición inválida después de setLngLat para ${usuario}`, { currentLngLat, expected: newLngLat });
+            // Revertir a última posición válida si existe
+            if (lastPos && Number.isFinite(lastPos.lat) && Number.isFinite(lastPos.lng)) {
+              marker.setLngLat([lastPos.lng, lastPos.lat]);
+            }
+            return;
+          }
+        } catch (error) {
+          console.error(`❌ ERROR al actualizar posición del marcador para ${usuario}:`, error, { newLngLat, finalLat, finalLng });
+          // Revertir a última posición válida si existe
+          if (lastPos && Number.isFinite(lastPos.lat) && Number.isFinite(lastPos.lng)) {
+            try {
+              marker.setLngLat([lastPos.lng, lastPos.lat]);
+            } catch (revertError) {
+              console.error(`❌ ERROR al revertir posición para ${usuario}:`, revertError);
+            }
+          }
+          return;
+        }
+        
+        // ELIMINADO: Rotación y cálculo de bearing - puede causar problemas y saltos
+        // NO aplicar rotación para evitar interferencias con la posición
+        
+        // Actualizar última posición válida SOLO si la actualización fue exitosa
+        this.conductoresLastPositions.set(conductorId, newPos);
+        
+        // Actualizar popup con nueva información
+        // IMPORTANTE: closeOnClick: false y closeOnMove: false para que no se cierre automáticamente
+        const speedKmh = (speed && Number.isFinite(speed)) ? (speed * 3.6).toFixed(1) : '0.0';
+        const popup = new Popup({ 
+          offset: 25,
+          closeOnClick: false, // No cerrar al hacer clic en el mapa
+          closeOnMove: false, // No cerrar al mover el mapa
+          closeButton: true, // Mostrar botón de cerrar
+          maxWidth: '300px'
+        })
+          .setHTML(`
+            <div style="min-width: 150px; pointer-events: auto;" onclick="event.stopPropagation();">
+              <strong>🚗 Conductor: ${usuario}</strong><br>
+              <small>Velocidad: ${speedKmh} km/h</small>
+            </div>
+          `);
+        
+        // Prevenir que el popup se cierre al hacer clic en el mapa
+        marker.setPopup(popup);
+        
+        // Agregar listener para prevenir el cierre del popup
+        marker.on('click', (e) => {
+          e.originalEvent?.stopPropagation();
+        });
+      } catch (error) {
+        console.error(`❌ Error al actualizar marcador de conductor ${usuario}:`, error);
+        // NO actualizar si hay error - mantener última posición válida
+        return;
+      }
+    }
+  }
 
   /**
    * Abre el modal de login
@@ -2041,15 +2811,80 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
       return;
     }
 
+    // Timeout de seguridad: si no hay respuesta en 10 segundos, cancelar
+    const timeoutId = setTimeout(() => {
+      this.loginCargando = false;
+      this.loginError = 'Tiempo de espera agotado. Verifique su conexión e intente nuevamente.';
+      socket.off('login-respuesta', respuestaHandler);
+      this.cdr.markForCheck();
+      console.error('⏱️ Timeout en login - No se recibió respuesta del servidor');
+    }, 10000); // 10 segundos
+
     // Escuchar respuesta del servidor (solo una vez)
-    const respuestaHandler = (respuesta: { success: boolean; usuario?: any; error?: string }) => {
+    const respuestaHandler = (respuesta: { success: boolean; usuario?: any; token?: string; error?: string }) => {
+      // Cancelar timeout si se recibió respuesta
+      clearTimeout(timeoutId);
       this.loginCargando = false;
 
       if (respuesta.success && respuesta.usuario) {
         // Login exitoso
         this.usuarioLogueado = respuesta.usuario;
+        
+        // Guardar sesión (usuario + token) en localStorage para persistencia
+        try {
+          const sesionData = {
+            usuario: respuesta.usuario,
+            token: respuesta.token || '' // Guardar token de sesión
+          };
+          localStorage.setItem('sesionUsuario', JSON.stringify(sesionData));
+          console.log('💾 Sesión y token guardados en localStorage');
+        } catch (error) {
+          console.warn('⚠️ No se pudo guardar la sesión en localStorage:', error);
+        }
+        
         this.mostrarAlerta(`Bienvenido, ${respuesta.usuario.usuario} (${respuesta.usuario.rol})`, 'success');
         this.cerrarModalLogin();
+        
+        // IMPORTANTE: TODOS los usuarios deben recibir ubicaciones de conductores
+        // Inicializar recepción de ubicaciones de conductores (para visitantes, trabajadores, etc.)
+        if (!this.conductorTrackingInitialized) {
+          console.log('👂 Inicializando recepción de ubicaciones de conductores');
+          this.initConductoresTracking();
+        }
+        
+        // Si el usuario es conductor, iniciar transmisión de ubicación propia
+        if (respuesta.usuario.rol === 'conductor') {
+          console.log('🚗 Usuario es conductor - ACTIVANDO SISTEMA COMPLETO DE TRACKING');
+          
+          // PRIORIDAD 1: Asegurar que el GPS esté activo (watchPosition)
+          // El GPS debe estar funcionando SIEMPRE, incluso sin conexión
+          if (!this.geoService.isTracking()) {
+            console.log('📍 Activando GPS para conductor');
+            this.geoService.iniciarGPS().catch(error => {
+              console.error('❌ Error al activar GPS:', error);
+            });
+          } else {
+            console.log('✅ GPS ya está activo');
+          }
+          
+          // PRIORIDAD 2: Iniciar transmisión de ubicación propia
+          // Esto activa el sistema de envío continuo y resiliente
+          // Esperar un momento para asegurar que el GPS esté listo
+          setTimeout(() => {
+            this.geoService.iniciarTransmisionConductor();
+          }, 500);
+          
+          // Asegurar que el socket esté conectado
+          if (socket.connected) {
+            console.log('✅ Socket conectado - Sistema de tracking activo');
+          } else {
+            console.warn('⚠️ Socket no conectado - El GPS seguirá funcionando y se reanudará al reconectar');
+          }
+          
+          this.mostrarAlerta('🚗 Modo conductor activado - Transmitiendo ubicación en tiempo real', 'success');
+        } else {
+          console.log(`✅ Usuario ${respuesta.usuario.rol} logueado - Recibiendo ubicaciones de conductores`);
+        }
         
         console.log('✅ Login exitoso:', respuesta.usuario);
       } else {
@@ -2060,16 +2895,40 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
 
       // Remover el listener después de usarlo
       socket.off('login-respuesta', respuestaHandler);
+      this.cdr.markForCheck();
     };
 
+    // IMPORTANTE: Registrar el listener ANTES de enviar el evento
     // Escuchar respuesta del servidor
     socket.on('login-respuesta', respuestaHandler);
+    
+    console.log('👂 Listener de login-respuesta registrado');
 
     // Enviar credenciales al servidor
-    socket.emit('login', {
+    console.log('📤 Enviando credenciales de login al servidor...', {
       usuario: this.loginUsuario.trim(),
-      clave: this.loginClave
+      socketConnected: socket.connected,
+      socketId: socket.id
     });
+    
+    try {
+      socket.emit('login', {
+        usuario: this.loginUsuario.trim(),
+        clave: this.loginClave
+      });
+      console.log('✅ Evento login emitido correctamente');
+    } catch (error) {
+      console.error('❌ Error al emitir evento login:', error);
+      clearTimeout(timeoutId);
+      this.loginCargando = false;
+      this.loginError = 'Error al enviar credenciales. Intente nuevamente.';
+      socket.off('login-respuesta', respuestaHandler);
+      this.cdr.markForCheck();
+      return;
+    }
+    
+    // Forzar detección de cambios
+    this.cdr.markForCheck();
   }
 
   /**
@@ -2078,6 +2937,14 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
   cerrarSesion(): void {
     const socket = this.socketService.getSocket();
     const usuarioAnterior = this.usuarioLogueado?.usuario || 'Usuario';
+
+    // Limpiar sesión de localStorage
+    try {
+      localStorage.removeItem('sesionUsuario');
+      console.log('🗑️ Sesión y token eliminados de localStorage');
+    } catch (error) {
+      console.warn('⚠️ Error al eliminar sesión de localStorage:', error);
+    }
 
     if (!socket || !socket.connected) {
       // Si no hay conexión, cerrar sesión localmente
@@ -2089,14 +2956,44 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     // Escuchar respuesta del servidor (solo una vez)
     const respuestaHandler = (respuesta: { success: boolean; error?: string }) => {
       if (respuesta.success) {
+        // Si era conductor, detener transmisión de ubicación y limpiar marcadores
+        if (this.usuarioLogueado?.rol === 'conductor') {
+          console.log('🚗 Usuario conductor cerrando sesión - DETENIENDO TRANSMISIÓN');
+          
+          // Detener transmisión (pero NO el GPS - puede seguir funcionando para otros usos)
+          this.geoService.detenerTransmisionConductor();
+          
+          // Limpiar marcadores de otros conductores
+          this.limpiarMarcadoresConductores();
+          
+          this.mostrarAlerta('🛑 Modo conductor desactivado - Transmisión detenida', 'info');
+        }
+        
         // Limpiar información del usuario
         this.usuarioLogueado = null;
+        // Limpiar sesión de localStorage (por si acaso)
+        try {
+          localStorage.removeItem('usuarioLogueado');
+        } catch (error) {
+          console.warn('⚠️ Error al eliminar sesión de localStorage:', error);
+        }
         // Mostrar mensaje de confirmación
         this.mostrarAlerta(`Sesión cerrada. Hasta luego, ${usuarioAnterior}`, 'info');
         console.log('✅ Sesión cerrada');
       } else {
         // Error al cerrar sesión (aún así limpiar localmente)
+        if (this.usuarioLogueado?.rol === 'conductor') {
+          console.log('🚗 Usuario conductor - Deteniendo transmisión (error en logout)');
+          this.geoService.detenerTransmisionConductor();
+          this.limpiarMarcadoresConductores();
+        }
         this.usuarioLogueado = null;
+        // Limpiar sesión de localStorage (por si acaso)
+        try {
+          localStorage.removeItem('sesionUsuario');
+        } catch (error) {
+          console.warn('⚠️ Error al eliminar sesión de localStorage:', error);
+        }
         this.mostrarAlerta('Sesión cerrada localmente', 'warning');
         console.warn('⚠️ Error al cerrar sesión en el servidor:', respuesta.error);
       }

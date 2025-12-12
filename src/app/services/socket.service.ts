@@ -14,16 +14,16 @@ export class SocketService {
   private userId: string | null = null;
 
   constructor(private userService: UserService) {
-    // Configuración mejorada de Socket.IO con mejor manejo de errores
+    // Configuración optimizada para MÁXIMA VELOCIDAD - Forzar WebSocket cuando sea posible
     this.socket = io(this.serverUrl, {
-      transports: ['polling', 'websocket'], // Intentar polling primero como fallback más confiable
+      transports: ['websocket', 'polling'], // Priorizar WebSocket para menor latencia
       upgrade: true,
-      rememberUpgrade: false,
+      rememberUpgrade: true, // Recordar upgrade a WebSocket
       reconnection: true,
       reconnectionDelay: 1000,
       reconnectionDelayMax: 5000,
       reconnectionAttempts: Infinity,
-      timeout: 20000,
+      timeout: 10000, // Timeout más corto para conexión rápida
       autoConnect: true,
       forceNew: false,
       withCredentials: false
@@ -58,6 +58,12 @@ export class SocketService {
 
     this.socket.on('disconnect', (reason: string) => {
       console.log('❌ Desconectado del servidor Socket.IO:', reason);
+      
+      // Emitir evento personalizado para que los componentes reaccionen
+      window.dispatchEvent(new CustomEvent('socket-disconnected', { 
+        detail: { reason } 
+      }));
+      
       if (reason === 'io server disconnect') {
         // El servidor desconectó el socket, necesitamos reconectar manualmente
         this.socket.connect();
@@ -79,6 +85,26 @@ export class SocketService {
 
     this.socket.on('reconnect', (attemptNumber: number) => {
       console.log(`✅ Reconexión exitosa después de ${attemptNumber} intentos`);
+      
+      // Emitir evento personalizado para que los componentes reaccionen
+      window.dispatchEvent(new CustomEvent('socket-reconnected', { 
+        detail: { attemptNumber } 
+      }));
+      
+      // Reenviar información del usuario si existe
+      try {
+        const userInfo = this.userService.getUserInfo();
+        if (userInfo && userInfo.id) {
+          this.socket.emit('usuario-conectado', {
+            id: userInfo.id,
+            nombre: userInfo.nombre,
+            plataforma: userInfo.plataforma,
+            timestamp: new Date().toISOString()
+          });
+        }
+      } catch (error) {
+        console.error('❌ Error al reenviar información de usuario:', error);
+      }
     });
 
     this.socket.on('reconnect_error', (error: Error) => {
