@@ -393,6 +393,14 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
       const attemptNumber = event.detail?.attemptNumber || 0;
       console.log('✅ Socket reconectado después de', attemptNumber, 'intentos');
       
+      // IMPORTANTE: Para TODOS los roles, reinicializar recepción de ubicaciones de conductores
+      // Esto asegura que se vuelvan a escuchar las ubicaciones después de la reconexión
+      console.log('🔄 Reinicializando recepción de ubicaciones de conductores después de reconexión (para todos los roles)');
+      
+      // Reinicializar tracking de conductores (forceReinit = true para forzar reinicialización)
+      // Esto remueve el listener anterior y registra uno nuevo
+      this.initConductoresTracking(true);
+      
       // Si es conductor, reanudar transmisión automáticamente
       if (this.usuarioLogueado?.rol === 'conductor') {
         console.log('🚗 Reconexión detectada - REANUDANDO TRANSMISIÓN para conductor');
@@ -407,9 +415,12 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
           console.log('📍 Reactivando GPS para conductor');
           this.geoService.iniciarGPS();
         }
-        
-        this.cdr.markForCheck();
+      } else {
+        // Para otros roles, solo mostrar notificación de reconexión
+        this.mostrarAlerta('✅ Conexión restaurada. Recibiendo ubicaciones de conductores.', 'success');
       }
+      
+      this.cdr.markForCheck();
     });
   }
 
@@ -2428,9 +2439,13 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
   /**
    * Inicializa el sistema de tracking de conductores
    */
-  private initConductoresTracking(): void {
-    // Evitar inicialización múltiple
-    if (this.conductorTrackingInitialized) {
+  /**
+   * Inicializa el sistema de tracking de conductores
+   * @param forceReinit - Si es true, fuerza la reinicialización incluso si ya estaba inicializado
+   */
+  private initConductoresTracking(forceReinit: boolean = false): void {
+    // Evitar inicialización múltiple (a menos que se fuerce)
+    if (this.conductorTrackingInitialized && !forceReinit) {
       console.warn('⚠️ initConductoresTracking ya fue inicializado, evitando duplicado');
       return;
     }
@@ -2444,6 +2459,12 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     if (!socket.connected) {
       console.warn('⚠️ Socket no conectado - El tracking se activará al reconectar');
       // Aún así registrar el listener para cuando se reconecte
+    }
+    
+    // Si se fuerza reinicialización, remover listener anterior para evitar duplicados
+    if (forceReinit && this.conductorLocationHandler) {
+      socket.off('ubicacion-conductor', this.conductorLocationHandler);
+      console.log('🧹 Listener anterior de ubicacion-conductor removido para reinicialización');
     }
     
     // Crear handler una sola vez y guardar referencia
