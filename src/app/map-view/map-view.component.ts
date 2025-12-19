@@ -120,6 +120,10 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
   private conductoresLastPositions = new Map<string, { lat: number; lng: number }>(); // Última posición para rotación
   // Mapa para asociar usuario con conductorId (para eliminar marcadores cuando se recibe notificación inactivo)
   private conductoresUsuarios: Map<string, string> = new Map(); // usuario -> conductorId
+  // Mapa para rastrear última vez que se recibió ubicación de cada conductor (timestamp)
+  private conductoresLastUpdate = new Map<string, number>(); // conductorId -> timestamp
+  // Intervalo para verificar conductores desconectados
+  private conductorTimeoutCheckInterval?: number;
   private iconCarroElement: HTMLElement;
   private conductorTrackingInitialized: boolean = false; // Flag para evitar listeners duplicados
   private conductorLocationHandler?: (data: any) => void; // Referencia al handler para poder removerlo
@@ -436,6 +440,7 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     this.conductoresMarkers = {};
     this.conductoresLastPositions.clear();
     this.conductoresUsuarios.clear();
+    this.conductoresLastUpdate.clear();
     console.log('🧹 Marcadores de conductores limpiados');
     this.cdr.markForCheck();
   }
@@ -443,6 +448,12 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
   ngOnDestroy(): void {
     // Desactivar Wake Lock
     this.desactivarWakeLock();
+    
+    // Limpiar intervalo de verificación de timeout de conductores
+    if (this.conductorTimeoutCheckInterval) {
+      clearInterval(this.conductorTimeoutCheckInterval);
+      this.conductorTimeoutCheckInterval = undefined;
+    }
     
     // Remover listener de eventos personalizados
     if (this.imagePopupListener) {
@@ -470,6 +481,7 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     });
     this.conductoresMarkers = {};
     this.conductoresLastPositions.clear();
+    this.conductoresLastUpdate.clear();
 
     // Limpiar marcadores guardados
     this.savedMarkers.forEach(marker => {
@@ -2481,6 +2493,99 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     socket.on('ubicacion-conductor', this.conductorLocationHandler);
     this.conductorTrackingInitialized = true;
     console.log('✅ Sistema de tracking de conductores inicializado - Listo para recibir ubicaciones');
+    
+    // Iniciar verificación periódica de conductores desconectados
+    this.iniciarVerificacionTimeoutConductores();
+  }
+  
+  /**
+   * Inicia la verificación periódica de conductores que dejan de enviar ubicaciones
+   * Verifica cada 2 segundos si algún conductor no ha enviado ubicaciones en los últimos 5 segundos
+   */
+  private iniciarVerificacionTimeoutConductores(): void {
+    // Limpiar intervalo anterior si existe
+    if (this.conductorTimeoutCheckInterval) {
+      clearInterval(this.conductorTimeoutCheckInterval);
+    }
+    
+    // Verificar cada 2 segundos para detección más rápida
+    this.conductorTimeoutCheckInterval = window.setInterval(() => {
+      this.verificarConductoresDesconectados();
+    }, 2000); // Verificar cada 2 segundos
+    
+    console.log('✅ Verificación de timeout de conductores iniciada (cada 2 segundos, timeout de 5 segundos)');
+  }
+  
+  /**
+   * Verifica si algún conductor no ha enviado ubicaciones en los últimos 5 segundos
+   * Si es así, lo considera desconectado y remueve su marcador
+   */
+  private verificarConductoresDesconectados(): void {
+    const ahora = Date.now();
+    const TIMEOUT_MS = 5000; // 5 segundos sin recibir ubicación = desconectado
+    
+    // Iterar sobre todos los conductores que tienen marcadores
+    Object.keys(this.conductoresMarkers).forEach(conductorId => {
+      const ultimaActualizacion = this.conductoresLastUpdate.get(conductorId);
+      
+      // Si no hay registro de última actualización, usar timestamp 0 (muy antiguo)
+      if (!ultimaActualizacion) {
+        // Si el marcador existe pero no hay registro de actualización, considerarlo desconectado
+        console.warn(`⚠️ Conductor ${conductorId} no tiene registro de última actualización, removiendo marcador`);
+        this.removerConductorDesconectado(conductorId);
+        return;
+      }
+      
+      const tiempoSinActualizacion = ahora - ultimaActualizacion;
+      
+      // Si no se ha recibido ubicación en los últimos 15 segundos, considerar desconectado
+      if (tiempoSinActualizacion > TIMEOUT_MS) {
+        const usuario = this.obtenerUsuarioPorConductorId(conductorId);
+        console.warn(`⚠️ Conductor ${usuario || conductorId} no ha enviado ubicación en ${Math.round(tiempoSinActualizacion / 1000)}s, removiendo marcador`);
+        this.removerConductorDesconectado(conductorId);
+      }
+    });
+  }
+  
+  /**
+   * Obtiene el nombre de usuario asociado a un conductorId
+   */
+  private obtenerUsuarioPorConductorId(conductorId: string): string | null {
+    for (const [usuario, id] of this.conductoresUsuarios.entries()) {
+      if (id === conductorId) {
+        return usuario;
+      }
+    }
+    return null;
+  }
+  
+  /**
+   * Remueve el marcador de un conductor desconectado y limpia sus datos
+   */
+  private removerConductorDesconectado(conductorId: string): void {
+    const marker = this.conductoresMarkers[conductorId];
+    if (marker) {
+      marker.remove();
+      delete this.conductoresMarkers[conductorId];
+    }
+    
+    // Limpiar datos asociados
+    this.conductoresLastPositions.delete(conductorId);
+    this.conductoresLastUpdate.delete(conductorId);
+    
+    // Limpiar asociación usuario -> conductorId
+    const usuario = this.obtenerUsuarioPorConductorId(conductorId);
+    if (usuario) {
+      this.conductoresUsuarios.delete(usuario);
+      
+      // Notificar al usuario que el conductor se desconectó
+      this.mostrarAlerta(`Conductor ${usuario} desconectado (sin señal)`, 'warning');
+      
+      // Enviar notificación al servicio de notificaciones
+      this.notificationService.pushNotification(`Conductor ${usuario} desconectado (sin señal)`, 'warning');
+    }
+    
+    this.cdr.markForCheck();
   }
 
   /**
@@ -2694,6 +2799,9 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
         // Guardar última posición válida para rotación
         this.conductoresLastPositions.set(conductorId, newPos);
         
+        // Registrar timestamp de creación (para detección de desconexión)
+        this.conductoresLastUpdate.set(conductorId, Date.now());
+        
         console.log(`✅ Marcador de conductor creado: ${usuario} en [${finalLat}, ${finalLng}]`);
       } catch (error) {
         console.error(`❌ Error al crear marcador de conductor ${usuario}:`, error);
@@ -2758,6 +2866,9 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
         
         // Actualizar última posición válida SOLO si la actualización fue exitosa
         this.conductoresLastPositions.set(conductorId, newPos);
+        
+        // Actualizar timestamp de última actualización (para detección de desconexión)
+        this.conductoresLastUpdate.set(conductorId, Date.now());
         
         // CRÍTICO: NO recrear el popup - solo actualizar su contenido si ya existe
         // Esto evita que se cierre el popup cuando el usuario lo tiene abierto
