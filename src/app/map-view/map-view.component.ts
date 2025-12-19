@@ -1810,14 +1810,19 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
           if (marcadorData.archivo && this.isImage(marcadorData.archivo)) {
             const archivoUrl = this.getFileUrl(marcadorData.archivo);
             if (archivoUrl) {
-              const escapedUrl = archivoUrl.replace(/'/g, "\\'");
+              // Escapar comillas y caracteres especiales para evitar problemas en el atributo onclick
+              const escapedUrl = archivoUrl.replace(/'/g, "\\'").replace(/"/g, '&quot;').replace(/\n/g, '\\n');
+              // Usar un ID único para el marcador para poder identificar el clic
+              const markerImageId = `marker-img-${marcadorData.id}`;
               popupContent += `
                 <div style="margin-top: 8px;">
-                  <img src="${archivoUrl}" 
+                  <img id="${markerImageId}" 
+                       src="${archivoUrl}" 
                        alt="Imagen adjunta" 
-                       class="w-20 h-20 object-cover rounded-md cursor-pointer"
-                       onclick="window.dispatchEvent(new CustomEvent('openImageFromPopup', { detail: '${escapedUrl}' }))"
-                       style="max-width: 200px; max-height: 150px; border-radius: 4px; object-fit: cover; display: block; cursor: pointer;">
+                       class="w-20 h-20 object-cover rounded-md cursor-pointer marker-popup-image"
+                       data-image-url="${escapedUrl}"
+                       style="max-width: 200px; max-height: 150px; border-radius: 4px; object-fit: cover; display: block; cursor: pointer;"
+                       onclick="event.stopPropagation(); const img = event.target; const url = img.getAttribute('data-image-url'); if (url) { window.dispatchEvent(new CustomEvent('openImageFromPopup', { detail: url })); }">
                 </div>
               `;
             }
@@ -1830,6 +1835,33 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
         // Asignar popup con contenido lazy
         popup.setHTML(generarPopupContent());
         marker.setPopup(popup);
+        
+        // Agregar listener para clics en imágenes del popup después de que se cree
+        // Esto asegura que el evento funcione correctamente
+        marker.on('popupopen', () => {
+          // Esperar un momento para que el DOM del popup esté completamente renderizado
+          setTimeout(() => {
+            const popupElement = marker.getPopup().getElement();
+            if (popupElement) {
+              const images = popupElement.querySelectorAll('.marker-popup-image');
+              images.forEach((img: any) => {
+                // Remover listener anterior si existe
+                if (img._imageClickHandler) {
+                  img.removeEventListener('click', img._imageClickHandler);
+                }
+                // Crear nuevo handler
+                img._imageClickHandler = (e: Event) => {
+                  e.stopPropagation();
+                  const imageUrl = img.getAttribute('data-image-url');
+                  if (imageUrl) {
+                    this.openImageModal(imageUrl);
+                  }
+                };
+                img.addEventListener('click', img._imageClickHandler);
+              });
+            }
+          }, 100);
+        });
         
         // Guardar datos del marcador para referencia
         (marker as any).marcadorData = marcadorData;
@@ -1933,15 +1965,19 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     if (marcadorData.archivo && this.isImage(marcadorData.archivo)) {
       const archivoUrl = this.getFileUrl(marcadorData.archivo);
       if (archivoUrl) {
-        // Escapar comillas simples en la URL para evitar problemas en el atributo onclick
-        const escapedUrl = archivoUrl.replace(/'/g, "\\'");
+        // Escapar comillas y caracteres especiales para evitar problemas en el atributo onclick
+        const escapedUrl = archivoUrl.replace(/'/g, "\\'").replace(/"/g, '&quot;').replace(/\n/g, '\\n');
+        // Usar un ID único para el marcador para poder identificar el clic
+        const markerImageId = `marker-img-${marcadorData.id}`;
         popupContent += `
           <div style="margin-top: 8px;">
-            <img src="${archivoUrl}" 
+            <img id="${markerImageId}" 
+                 src="${archivoUrl}" 
                  alt="Imagen adjunta" 
-                 class="w-20 h-20 object-cover rounded-md cursor-pointer"
-                 onclick="window.dispatchEvent(new CustomEvent('openImageFromPopup', { detail: '${escapedUrl}' }))"
-                 style="max-width: 200px; max-height: 150px; border-radius: 4px; object-fit: cover; display: block; cursor: pointer;">
+                 class="w-20 h-20 object-cover rounded-md cursor-pointer marker-popup-image"
+                 data-image-url="${escapedUrl}"
+                 style="max-width: 200px; max-height: 150px; border-radius: 4px; object-fit: cover; display: block; cursor: pointer;"
+                 onclick="event.stopPropagation(); const img = event.target; const url = img.getAttribute('data-image-url'); if (url) { window.dispatchEvent(new CustomEvent('openImageFromPopup', { detail: url })); }">
           </div>
         `;
       }
@@ -1962,6 +1998,31 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
       .setHTML(popupContent);
     
     marker.setPopup(popup);
+    
+    // Agregar listener para clics en imágenes del popup después de que se cree
+    // Esto asegura que el evento funcione correctamente
+    marker.on('popupopen', () => {
+      // Esperar un momento para que el DOM del popup esté completamente renderizado
+      setTimeout(() => {
+        const popupElement = marker.getPopup().getElement();
+        if (popupElement) {
+          const images = popupElement.querySelectorAll('.marker-popup-image');
+          images.forEach((img: any) => {
+            // Remover listener anterior si existe
+            img.removeEventListener('click', img._imageClickHandler);
+            // Crear nuevo handler
+            img._imageClickHandler = (e: Event) => {
+              e.stopPropagation();
+              const imageUrl = img.getAttribute('data-image-url');
+              if (imageUrl) {
+                this.openImageModal(imageUrl);
+              }
+            };
+            img.addEventListener('click', img._imageClickHandler);
+          });
+        }
+      }, 100);
+    });
     
     // Guardar datos del marcador en el marker para referencia
     (marker as any).marcadorData = marcadorData;
@@ -2152,8 +2213,15 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
    * @param imageUrl - URL de la imagen a mostrar
    */
   openImageModal(imageUrl: string): void {
-    this.selectedImage = imageUrl;
+    if (!imageUrl) {
+      console.warn('⚠️ Intento de abrir modal de imagen sin URL');
+      return;
+    }
+    // Decodificar URL si está codificada
+    const decodedUrl = decodeURIComponent(imageUrl);
+    this.selectedImage = decodedUrl;
     this.showImageModal = true;
+    this.cdr.markForCheck(); // Forzar actualización de UI con OnPush
   }
 
   /**
