@@ -122,6 +122,10 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
   private conductoresUsuarios: Map<string, string> = new Map(); // usuario -> conductorId
   // Mapa para rastrear última vez que se recibió ubicación de cada conductor (timestamp)
   private conductoresLastUpdate = new Map<string, number>(); // conductorId -> timestamp
+  // Mapa para rastrear tiempos entre actualizaciones (para detectar señal irregular)
+  private conductoresUpdateIntervals = new Map<string, number[]>(); // conductorId -> array de intervalos en ms
+  // Mapa para almacenar el estado de señal de cada conductor
+  private conductoresSignalState = new Map<string, 'buena' | 'regular' | 'mala'>(); // conductorId -> estado
   // Intervalo para verificar conductores desconectados
   private conductorTimeoutCheckInterval?: number;
   private iconCarroElement: HTMLElement;
@@ -177,8 +181,10 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
 
   /**
    * Crea un elemento HTML para icono de conductor tipo Waze (círculo con punto central)
+   * @param size Tamaño del icono en píxeles
+   * @param signalState Estado de la señal: 'buena' (verde), 'regular' (amarillo), 'mala' (rojo)
    */
-  private createConductorIcon(size: number): HTMLElement {
+  private createConductorIcon(size: number, signalState: 'buena' | 'regular' | 'mala' = 'buena'): HTMLElement {
     const el = document.createElement('div');
     el.style.width = `${size}px`;
     el.style.height = `${size}px`;
@@ -187,14 +193,35 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     el.style.alignItems = 'center';
     el.style.justifyContent = 'center';
     
-    // Círculo exterior (borde azul)
+    // Determinar color según estado de señal
+    let backgroundColor: string;
+    let shadowColor: string;
+    switch (signalState) {
+      case 'buena':
+        backgroundColor = '#3b82f6'; // Azul (normal)
+        shadowColor = 'rgba(59, 130, 246, 0.3)';
+        break;
+      case 'regular':
+        backgroundColor = '#f59e0b'; // Amarillo/Naranja (señal regular)
+        shadowColor = 'rgba(245, 158, 11, 0.3)';
+        break;
+      case 'mala':
+        backgroundColor = '#ef4444'; // Rojo (señal mala)
+        shadowColor = 'rgba(239, 68, 68, 0.3)';
+        break;
+      default:
+        backgroundColor = '#3b82f6';
+        shadowColor = 'rgba(59, 130, 246, 0.3)';
+    }
+    
+    // Círculo exterior (color según estado de señal)
     const outerCircle = document.createElement('div');
     outerCircle.style.width = `${size}px`;
     outerCircle.style.height = `${size}px`;
     outerCircle.style.borderRadius = '50%';
-    outerCircle.style.backgroundColor = '#3b82f6'; // Azul
+    outerCircle.style.backgroundColor = backgroundColor;
     outerCircle.style.border = '3px solid white';
-    outerCircle.style.boxShadow = '0 2px 8px rgba(0,0,0,0.3), 0 0 0 2px rgba(59, 130, 246, 0.3)';
+    outerCircle.style.boxShadow = `0 2px 8px rgba(0,0,0,0.3), 0 0 0 2px ${shadowColor}`;
     outerCircle.style.position = 'absolute';
     outerCircle.style.top = '0';
     outerCircle.style.left = '0';
@@ -441,6 +468,8 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     this.conductoresLastPositions.clear();
     this.conductoresUsuarios.clear();
     this.conductoresLastUpdate.clear();
+    this.conductoresUpdateIntervals.clear();
+    this.conductoresSignalState.clear();
     console.log('🧹 Marcadores de conductores limpiados');
     this.cdr.markForCheck();
   }
@@ -2572,6 +2601,8 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     // Limpiar datos asociados
     this.conductoresLastPositions.delete(conductorId);
     this.conductoresLastUpdate.delete(conductorId);
+    this.conductoresUpdateIntervals.delete(conductorId);
+    this.conductoresSignalState.delete(conductorId);
     
     // Limpiar asociación usuario -> conductorId
     const usuario = this.obtenerUsuarioPorConductorId(conductorId);
@@ -2586,6 +2617,102 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     }
     
     this.cdr.markForCheck();
+  }
+  
+  /**
+   * Calcula el estado de señal basado en el tiempo promedio entre actualizaciones
+   * @param promedioIntervalo Tiempo promedio en milisegundos entre actualizaciones
+   * @returns Estado de señal: 'buena', 'regular', o 'mala'
+   */
+  private calcularEstadoSenal(promedioIntervalo: number): 'buena' | 'regular' | 'mala' {
+    // Si el promedio es menor a 1000ms (1 segundo), señal excelente
+    if (promedioIntervalo <= 1000) {
+      return 'buena';
+    }
+    // Si el promedio está entre 1000ms y 3000ms (1-3 segundos), señal regular
+    if (promedioIntervalo <= 3000) {
+      return 'regular';
+    }
+    // Si el promedio es mayor a 3000ms (3 segundos), señal mala
+    return 'mala';
+  }
+  
+  /**
+   * Obtiene el texto descriptivo del estado de señal
+   */
+  private obtenerTextoEstadoSenal(estado: 'buena' | 'regular' | 'mala'): string {
+    switch (estado) {
+      case 'buena':
+        return 'Buena';
+      case 'regular':
+        return 'Regular';
+      case 'mala':
+        return 'Mala';
+      default:
+        return 'Desconocida';
+    }
+  }
+  
+  /**
+   * Obtiene el color para mostrar el estado de señal
+   */
+  private obtenerColorEstadoSenal(estado: 'buena' | 'regular' | 'mala'): string {
+    switch (estado) {
+      case 'buena':
+        return '#10b981'; // Verde
+      case 'regular':
+        return '#f59e0b'; // Amarillo/Naranja
+      case 'mala':
+        return '#ef4444'; // Rojo
+      default:
+        return '#6b7280'; // Gris
+    }
+  }
+  
+  /**
+   * Actualiza el color del marcador de un conductor según su estado de señal
+   */
+  private actualizarColorMarcadorConductor(conductorId: string, estadoSenal: 'buena' | 'regular' | 'mala'): void {
+    const marker = this.conductoresMarkers[conductorId];
+    if (!marker) {
+      return;
+    }
+    
+    const iconElement = marker.getElement();
+    if (!iconElement) {
+      return;
+    }
+    
+    // Buscar el círculo exterior en el elemento del marcador
+    const outerCircle = iconElement.querySelector('div') as HTMLElement;
+    if (!outerCircle) {
+      return;
+    }
+    
+    // Determinar color según estado de señal
+    let backgroundColor: string;
+    let shadowColor: string;
+    switch (estadoSenal) {
+      case 'buena':
+        backgroundColor = '#3b82f6'; // Azul
+        shadowColor = 'rgba(59, 130, 246, 0.3)';
+        break;
+      case 'regular':
+        backgroundColor = '#f59e0b'; // Amarillo/Naranja
+        shadowColor = 'rgba(245, 158, 11, 0.3)';
+        break;
+      case 'mala':
+        backgroundColor = '#ef4444'; // Rojo
+        shadowColor = 'rgba(239, 68, 68, 0.3)';
+        break;
+      default:
+        backgroundColor = '#3b82f6';
+        shadowColor = 'rgba(59, 130, 246, 0.3)';
+    }
+    
+    // Actualizar color del círculo exterior
+    outerCircle.style.backgroundColor = backgroundColor;
+    outerCircle.style.boxShadow = `0 2px 8px rgba(0,0,0,0.3), 0 0 0 2px ${shadowColor}`;
   }
 
   /**
@@ -2695,8 +2822,11 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
       }
 
       try {
-        // Crear icono tipo Waze para el conductor (clonar el elemento base)
-        const iconElement = this.iconCarroElement.cloneNode(true) as HTMLElement;
+        // Obtener estado de señal inicial (o 'buena' por defecto)
+        const estadoSenal = this.conductoresSignalState.get(conductorId) || 'buena';
+        
+        // Crear icono tipo Waze para el conductor con el color según estado de señal
+        const iconElement = this.createConductorIcon(40, estadoSenal);
         
         // Asegurar que el elemento tenga dimensiones válidas
         iconElement.style.width = '40px';
@@ -2774,6 +2904,9 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
         // Agregar popup con información del conductor
         // IMPORTANTE: closeOnClick: false y closeOnMove: false para que no se cierre automáticamente
         const speedKmh = (speed && Number.isFinite(speed)) ? (speed * 3.6).toFixed(1) : '0.0';
+        const estadoSenalInicial = this.conductoresSignalState.get(conductorId) || 'buena';
+        const estadoSenalTextoInicial = this.obtenerTextoEstadoSenal(estadoSenalInicial);
+        const colorSenalInicial = this.obtenerColorEstadoSenal(estadoSenalInicial);
         const popup = new Popup({ 
           offset: 25,
           closeOnClick: false, // No cerrar al hacer clic en el mapa
@@ -2784,7 +2917,8 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
           .setHTML(`
             <div style="min-width: 150px; pointer-events: auto;" onclick="event.stopPropagation();">
               <strong>🚗 Conductor: ${usuario}</strong><br>
-              <small>Velocidad: ${speedKmh} km/h</small>
+              <small>Velocidad: ${speedKmh} km/h</small><br>
+              <small style="color: ${colorSenalInicial}; font-weight: bold;">📶 Señal: ${estadoSenalTextoInicial}</small>
             </div>
           `);
         
@@ -2800,7 +2934,11 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
         this.conductoresLastPositions.set(conductorId, newPos);
         
         // Registrar timestamp de creación (para detección de desconexión)
-        this.conductoresLastUpdate.set(conductorId, Date.now());
+        const ahora = Date.now();
+        this.conductoresLastUpdate.set(conductorId, ahora);
+        
+        // Inicializar estado de señal como "buena" para nuevo conductor
+        this.conductoresSignalState.set(conductorId, 'buena');
         
         console.log(`✅ Marcador de conductor creado: ${usuario} en [${finalLat}, ${finalLng}]`);
       } catch (error) {
@@ -2868,7 +3006,39 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
         this.conductoresLastPositions.set(conductorId, newPos);
         
         // Actualizar timestamp de última actualización (para detección de desconexión)
-        this.conductoresLastUpdate.set(conductorId, Date.now());
+        const ahora = Date.now();
+        const ultimaActualizacion = this.conductoresLastUpdate.get(conductorId);
+        this.conductoresLastUpdate.set(conductorId, ahora);
+        
+        // Calcular intervalo entre actualizaciones (para detectar señal irregular)
+        if (ultimaActualizacion) {
+          const intervalo = ahora - ultimaActualizacion;
+          let intervalos = this.conductoresUpdateIntervals.get(conductorId) || [];
+          intervalos.push(intervalo);
+          
+          // Mantener solo los últimos 10 intervalos para calcular promedio
+          if (intervalos.length > 10) {
+            intervalos = intervalos.slice(-10);
+          }
+          
+          this.conductoresUpdateIntervals.set(conductorId, intervalos);
+          
+          // Calcular estado de señal basado en el promedio de intervalos
+          const promedioIntervalo = intervalos.reduce((a, b) => a + b, 0) / intervalos.length;
+          const estadoSenal = this.calcularEstadoSenal(promedioIntervalo);
+          this.conductoresSignalState.set(conductorId, estadoSenal);
+          
+          // Actualizar color del marcador si cambió el estado de señal
+          this.actualizarColorMarcadorConductor(conductorId, estadoSenal);
+        } else {
+          // Primera actualización, establecer estado inicial como "buena"
+          this.conductoresSignalState.set(conductorId, 'buena');
+        }
+        
+        // Obtener estado de señal actual para actualización
+        const estadoSenalActual = this.conductoresSignalState.get(conductorId) || 'buena';
+        const estadoSenalTextoActual = this.obtenerTextoEstadoSenal(estadoSenalActual);
+        const colorSenalActual = this.obtenerColorEstadoSenal(estadoSenalActual);
         
         // CRÍTICO: NO recrear el popup - solo actualizar su contenido si ya existe
         // Esto evita que se cierre el popup cuando el usuario lo tiene abierto
@@ -2879,7 +3049,8 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
           popupExistente.setHTML(`
             <div style="min-width: 150px; pointer-events: auto;" onclick="event.stopPropagation();">
               <strong>🚗 Conductor: ${usuario}</strong><br>
-              <small>Velocidad: ${speedKmh} km/h</small>
+              <small>Velocidad: ${speedKmh} km/h</small><br>
+              <small style="color: ${colorSenalActual}; font-weight: bold;">📶 Señal: ${estadoSenalTextoActual}</small>
             </div>
           `);
         } else {
