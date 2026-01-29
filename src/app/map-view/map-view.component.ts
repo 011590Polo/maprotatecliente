@@ -590,6 +590,9 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
 
     // Crear botón para resetear rotación
     this.createResetRotationButton();
+    
+    // Agregar funcionalidad personalizada al botón de reset bearing (flecha en espiral)
+    this.setupResetBearingButton();
 
     // Inicializar fuente y capa para rutas
     this.map.on('load', () => {
@@ -666,6 +669,120 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
     }
   }
 
+  /**
+   * Configura funcionalidad personalizada para el botón de reset bearing (flecha en espiral)
+   * Este botón aparece en NavigationControl cuando el mapa está rotado
+   */
+  private setupResetBearingButton(): void {
+    if (!this.map) return;
+
+    // Esperar a que el mapa se cargue y los controles se rendericen
+    this.map.on('load', () => {
+      // Usar un pequeño delay para asegurar que los controles estén renderizados
+      setTimeout(() => {
+        this.attachResetBearingHandler();
+      }, 500);
+    });
+
+    // También intentar después de que el mapa esté completamente listo
+    setTimeout(() => {
+      this.attachResetBearingHandler();
+    }, 1000);
+
+    // Escuchar cuando el mapa se rota para adjuntar el handler cuando el botón aparezca
+    this.map.on('rotate', () => {
+      // El botón aparece cuando hay rotación, intentar adjuntar handler
+      setTimeout(() => {
+        this.attachResetBearingHandler();
+      }, 100);
+    });
+  }
+
+  /**
+   * Adjunta el handler personalizado al botón de reset bearing
+   */
+  private attachResetBearingHandler(): void {
+    // El botón de reset bearing puede tener diferentes clases según la versión de MapLibre
+    // Intentar diferentes selectores
+    const selectors = [
+      '.maplibregl-ctrl-compass',
+      '.maplibregl-ctrl-rotate',
+      'button[aria-label*="Reset"]',
+      'button[title*="Reset"]',
+      'button[title*="Bearing"]'
+    ];
+    
+    let resetBearingButton: HTMLElement | null = null;
+    
+    for (const selector of selectors) {
+      const button = document.querySelector(selector) as HTMLElement;
+      if (button && button.closest('.maplibregl-ctrl')) {
+        resetBearingButton = button;
+        break;
+      }
+    }
+    
+    if (resetBearingButton) {
+      // Verificar si ya tiene nuestro handler personalizado
+      if ((resetBearingButton as any)._customBearingHandler) {
+        return; // Ya tiene el handler, no duplicar
+      }
+      
+      // Agregar listener personalizado
+      const customHandler = (e: Event) => {
+        e.stopPropagation();
+        // Ejecutar funcionalidad personalizada
+        this.onResetBearingClick();
+        // El comportamiento original de resetear bearing se ejecutará automáticamente
+        // ya que nuestro handler se ejecuta antes (capture phase)
+      };
+      
+      resetBearingButton.addEventListener('click', customHandler, true); // Usar capture phase
+      (resetBearingButton as any)._customBearingHandler = customHandler;
+      
+      console.log('✅ Handler personalizado agregado al botón de reset bearing');
+    }
+  }
+
+  /**
+   * Función que se ejecuta cuando se hace clic en el botón de reset bearing
+   * Puedes personalizar esta función según tus necesidades
+   */
+  private onResetBearingClick(): void {
+    console.log('🔄 Botón de reset bearing clickeado - Ejecutando funcionalidad personalizada');
+    
+    if (!this.map) return;
+
+    // Funcionalidad personalizada: Resetear rotación Y centrar en ubicación del usuario si está disponible
+    const userLocation = this.userLocationMarker?.getLngLat();
+    
+    if (userLocation) {
+      // Si hay ubicación del usuario, centrar el mapa en esa ubicación y resetear rotación
+      this.map.easeTo({
+        center: [userLocation.lng, userLocation.lat],
+        bearing: 0,
+        pitch: 0,
+        zoom: this.map.getZoom(),
+        duration: 600
+      });
+      
+      this.mostrarAlerta('Mapa centrado en tu ubicación y rotación reseteada', 'info');
+    } else {
+      // Si no hay ubicación del usuario, solo resetear rotación (comportamiento por defecto)
+      this.map.easeTo({
+        bearing: 0,
+        pitch: 0,
+        duration: 600
+      });
+      
+      this.mostrarAlerta('Rotación del mapa reseteada', 'info');
+    }
+    
+    // Re-adjuntar el handler después de un momento (por si el botón se recrea)
+    setTimeout(() => {
+      this.attachResetBearingHandler();
+    }, 700);
+  }
 
   /**
    * Configura la capa para rutas (GeoJSON)
@@ -2230,6 +2347,13 @@ export class MapViewComponent implements AfterViewInit, OnDestroy {
   closeImageModal(): void {
     this.showImageModal = false;
     this.selectedImage = null;
+  }
+
+  /**
+   * Recarga la página
+   */
+  recargarPagina(): void {
+    window.location.reload();
   }
 
   /**
